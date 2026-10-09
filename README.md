@@ -1,42 +1,60 @@
-# Chart AI — Phase 1
+# Chart AI
 
-Minimalist crypto charting application, React + TypeScript + Lightweight Charts v5 and Express/Node. Includes three exchange adapters and optional Gemini interpretation of deterministic chart statistics.
+Real-time multi-exchange crypto charting with TradingView Lightweight Charts, deterministic technical analysis, Gemini or Venice AI chat, optional Gemini explanations, and guarded educational signals.
 
-## Exchanges
-- **Binance Spot:** 500 historical candles + WebSocket candle streaming.
-- **Bybit Linear USDT perpetuals:** 500 historical candles + refresh polling every 10 seconds.
-- **OKX Spot:** 300 historical candles + refresh polling every 10 seconds.
+## Market data
 
-Use exchange-specific listed symbols only, e.g. BTCUSDT. Aster ANSEM/USDT is NOT supported yet. Polling data is not tick-by-tick streaming. Geographic/API restrictions may limit upstream connectivity. Unsupported symbols raise an error instead of substituting prices.
+- Binance Spot
+- Bybit Linear
+- OKX Spot
+- Aster Perpetual
+- Hyperliquid Perpetuals
+- MEXC Spot
+
+The searchable market picker combines every exchange reachable from the running server. Historical candles are fetched through the Node API and live candles stream from each exchange WebSocket.
 
 ## Run locally
-1. Install Node.js 20+ (22 recommended).
-2. Unzip and open a terminal in this folder.
-3. Run `npm install`.
-4. Copy `.env.example` to `.env` (Gemini is optional).
-5. Run `npm run dev`.
-6. Open http://localhost:5173.
 
-`npm run build` generates frontend assets only; `npm run server` runs the API, default port 3001. During development Vite proxies `/api` to the API server. Production deployment needs an HTTPS API reverse proxy or same-origin backend.
+1. Install Node.js 20 or newer.
+2. Run `npm install`.
+3. Copy `.env.example` to `.env` and set `GEMINI_API_KEY` and/or `VENICE_API_KEY`.
+4. Run `npm run dev`.
+5. Open `http://localhost:5173`.
 
-## Features
-- Exchange selector and pair input, six timeframes
-- Interactive candlesticks, zoom, pan and crosshair
-- Confirmed three-bar swing pivots
-- ATR-clustered price levels and basic market trend classification
-- Overlays can be toggled
-- Gemini AI summary from structured analysis (requires server-side `GEMINI_API_KEY`)
-- Exchange errors and live/refresh status
+For a production-style run, run `npm run build` followed by `npm start`. Express serves both `/api/*` and the built React application.
 
-## Important limitations
-- This is a Phase 1 engineering starter, not a validated trading strategy or production-grade data terminal.
-- Tested Node server syntax and checked project assets; **could not install npm dependencies in the build environment**, so the frontend compilation and live exchange access have not been verified. Run `npm install` and `npm run build` on your computer.
-- No automated trades or wallet access. No reliable probability estimates.
-- Server currently accepts client-submitted analysis for the AI explanation endpoint; before public deployment calculate and validate those statistics server-side and add input/rate limits.
-- Market data may lag, rate-limit, or be unavailable. Add reconnect/backoff, caching, request throttling and monitoring before public deployment.
+## Google AI Studio
 
-## AI Studio
-Push this folder to a GitHub repository, then import it into Google AI Studio Build mode or your development workspace. Ask the AI coding agent to run `npm install`, `npm run build`, and fix any errors. Keep `GEMINI_API_KEY` server-only.
+This project follows Google AI Studio's full-stack security model:
 
-## Next phase
-Aster integration for ANSEM/USDT (subject to a supported market-data endpoint), real-time Bybit/OKX WebSockets, drawing zones as filled primitives, structure breaks and educational AI chat.
+- Gemini calls run only in `server/index.js`.
+- The browser never receives the Gemini API key.
+- The browser never receives the Venice API key either.
+- The server reads `GEMINI_API_KEY` and `VENICE_API_KEY` from the environment.
+- The server binds to `0.0.0.0` and respects the injected `PORT` value.
+- `npm run build` creates the React client and `npm start` serves the complete app.
+
+Import the repository into Google AI Studio Build mode, open **Settings → Secrets**, and add `GEMINI_API_KEY`. To enable Venice as a chat choice, also add `VENICE_API_KEY` as a server secret. AI Studio injects those secrets into the server-side runtime. The public exchange URLs and `VENICE_API_URL` can remain at the defaults in `.env.example`.
+
+## AI chat
+
+The analyst sidebar includes a free-text conversation panel. Users can choose Gemini or Venice AI, optionally attach the current exchange, pair, timeframe, and deterministic chart analysis, or turn chart context off for crypto education and general reasoning. Conversation history is kept in the browser for the current page session only. Market commentary remains educational and does not execute trades.
+
+## Chart controls
+
+The chart starts clean with overlays disabled. Users can selectively enable:
+
+- EMA 20, EMA 50, SMA 200, rolling VWAP, Bollinger Bands, and Donchian Channel
+- Fibonacci retracement, fair value gaps, order blocks, and BOS/CHOCH
+- Confirmed swing pivots
+- Individually selected support and resistance zones
+
+Visible labels, chart marks, and analysis cards can be clicked for an explanation. Fibonacci levels include percentage and descriptive labels. Support levels are ordered from lowest upward; resistance levels are ordered from highest downward.
+
+## Safety and limitations
+
+- AI signals are educational and not financial advice.
+- Users must acknowledge the risk warning before generating a signal.
+- The application never executes trades or accesses wallets.
+- Exchange availability depends on geography, network policy, maintenance, and rate limits.
+- Technical-analysis patterns are deterministic observations, not guarantees of future price movement.
