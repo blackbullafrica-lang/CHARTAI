@@ -2146,7 +2146,7 @@ function App() {
                     onPointerCancel={(event) => cancelLevelDrag(event, zone)}
                     onClick={(event) => handleLevelClick(event, zone)}
                   >
-                    ↕ {zone.kind} {zone.rank} · {formatPrice(zone.price)} ·{" "}
+                    {zone.kind} {zone.rank} · {formatPrice(zone.price)} ·{" "}
                     {zone.touches} touches
                   </button>
                 </div>

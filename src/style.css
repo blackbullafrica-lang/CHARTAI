@@ -489,6 +489,10 @@ footer a:hover {
   inset: 0;
   min-height: 0;
 }
+.chart-stage .chart-area,
+.chart-stage .chart-area * {
+  cursor: none !important;
+}
 .zone-layer {
   position: absolute;
   z-index: 2;
@@ -526,7 +530,7 @@ footer a:hover {
   border: 1px solid transparent;
   color: inherit;
   pointer-events: auto;
-  cursor: ns-resize;
+  cursor: none;
   touch-action: none;
   user-select: none;
 }
