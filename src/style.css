@@ -543,6 +543,23 @@ footer a:hover {
   background: #171a1ff2;
   box-shadow: 0 4px 16px #000a;
 }
+.zone-rect.returning button {
+  animation: invalid-zone-drop 420ms ease-out;
+}
+@keyframes invalid-zone-drop {
+  0%,
+  45% {
+    border-color: #ef6f79;
+    background: #3b1d22f2;
+    transform: translateY(-50%) translateX(-4px);
+  }
+  70% {
+    transform: translateY(-50%) translateX(3px);
+  }
+  100% {
+    transform: translateY(-50%) translateX(0);
+  }
+}
 .zone-rect.support button {
   color: #56d6ad;
 }

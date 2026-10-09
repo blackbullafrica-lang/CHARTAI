@@ -356,6 +356,9 @@ function App() {
     {},
   );
   const [draggingLevelKey, setDraggingLevelKey] = useState<string | null>(null);
+  const [returningLevelKey, setReturningLevelKey] = useState<string | null>(
+    null,
+  );
   const [concepts, setConcepts] = useState<Record<ConceptKey, boolean>>({
     fibonacci: false,
     fairValueGaps: false,
@@ -408,6 +411,8 @@ function App() {
     pointerId: number;
     key: string;
     startY: number;
+    startPrice: number;
+    currentPrice: number;
     moved: boolean;
   } | null>(null);
   const suppressZoneClickRef = useRef(false);
@@ -503,6 +508,7 @@ function App() {
   useEffect(() => {
     setLevelOverrides({});
     setDraggingLevelKey(null);
+    setReturningLevelKey(null);
     zoneDragRef.current = null;
   }, [provider, symbol, interval]);
   useEffect(() => {
@@ -1057,9 +1063,17 @@ function App() {
     }
     const completed = candles.filter((c) => c.closed),
       markers: any[] = [];
-    if (showPivots)
+    if (showPivots) {
+      const markedPivots = [
+        ...analysis.pivots
+          .filter((pivot) => pivot.kind === "high")
+          .slice(-8),
+        ...analysis.pivots
+          .filter((pivot) => pivot.kind === "low")
+          .slice(-8),
+      ].sort((a, b) => a.index - b.index);
       markers.push(
-        ...analysis.pivots.slice(-8).flatMap((p) =>
+        ...markedPivots.flatMap((p) =>
           completed[p.index]
             ? [
                 {
@@ -1076,6 +1090,7 @@ function App() {
             : [],
         ),
       );
+    }
     if (concepts.structure)
       markers.push(
         ...analysis.smartMoney.structureEvents.flatMap((event) =>
@@ -1123,9 +1138,17 @@ function App() {
       ) => {
         const info = original();
         if (!info || !info.priceRange) return info;
-        const selectedPrices = visibleLevels.map((level) => level.price);
-        const minValue = Math.min(info.priceRange.minValue, ...selectedPrices);
-        const maxValue = Math.max(info.priceRange.maxValue, ...selectedPrices);
+        const zoneBand = analysis
+          ? Math.max(analysis.atr * 0.35, analysis.last * 0.001)
+          : 0;
+        const selectedLows = visibleLevels.map(
+          (level) => level.price - zoneBand,
+        );
+        const selectedHighs = visibleLevels.map(
+          (level) => level.price + zoneBand,
+        );
+        const minValue = Math.min(info.priceRange.minValue, ...selectedLows);
+        const maxValue = Math.max(info.priceRange.maxValue, ...selectedHighs);
         const padding = Math.max(
           (maxValue - minValue) * 0.025,
           maxValue * 0.001,
@@ -1160,7 +1183,7 @@ function App() {
       levelPriceLinesRef.current = [];
       series.applyOptions({ autoscaleInfoProvider: undefined });
     };
-  }, [visibleLevels]);
+  }, [analysis, visibleLevels]);
   useEffect(() => {
     const chart = chartRef.current,
       series = seriesRef.current,
@@ -1369,10 +1392,13 @@ function App() {
   ) {
     if (event.button !== 0) return;
     suppressZoneClickRef.current = false;
+    setReturningLevelKey(null);
     zoneDragRef.current = {
       pointerId: event.pointerId,
       key: zone.dragKey,
       startY: event.clientY,
+      startPrice: zone.price,
+      currentPrice: zone.price,
       moved: false,
     };
     setDraggingLevelKey(zone.dragKey);
@@ -1403,17 +1429,69 @@ function App() {
       zone.maxPrice,
       Math.max(zone.minPrice, pointerPrice),
     );
+    drag.currentPrice = nextPrice;
     setLevelOverrides((current) => ({
       ...current,
       [zone.dragKey]: nextPrice,
     }));
   }
-  function finishLevelDrag(event: React.PointerEvent<HTMLButtonElement>) {
+  function saveLevelPosition(zone: ZoneRect, price: number) {
+    setLevelOverrides((current) => {
+      const next = { ...current };
+      const sameAsDetected =
+        Math.abs(price - zone.originalPrice) <=
+        Math.max(Number.EPSILON, Math.abs(zone.originalPrice) * 1e-10);
+      if (sameAsDetected) delete next[zone.dragKey];
+      else next[zone.dragKey] = price;
+      return next;
+    });
+  }
+  function returnLevelToStart(zone: ZoneRect, price: number) {
+    saveLevelPosition(zone, price);
+    setReturningLevelKey(zone.dragKey);
+    window.setTimeout(() => {
+      setReturningLevelKey((current) =>
+        current === zone.dragKey ? null : current,
+      );
+    }, 420);
+  }
+  function finishLevelDrag(
+    event: React.PointerEvent<HTMLButtonElement>,
+    zone: ZoneRect,
+  ) {
     const drag = zoneDragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     suppressZoneClickRef.current = drag.moved;
     zoneDragRef.current = null;
     setDraggingLevelKey(null);
+    if (drag.moved) {
+      const sameKindLevels =
+        zone.kind === "support" ? supportLevels : resistanceLevels;
+      const validTargets = sameKindLevels.filter(
+        (level) =>
+          level.price >= zone.minPrice - Number.EPSILON &&
+          level.price <= zone.maxPrice + Number.EPSILON,
+      );
+      const nearestTarget = validTargets.reduce<Level | null>(
+        (nearest, candidate) =>
+          !nearest ||
+          Math.abs(candidate.price - drag.currentPrice) <
+            Math.abs(nearest.price - drag.currentPrice)
+            ? candidate
+            : nearest,
+        null,
+      );
+      const validDropDistance = Math.max(
+        (analysis?.atr ?? 0) * 0.4,
+        Math.abs(drag.currentPrice) * 0.001,
+      );
+      if (
+        nearestTarget &&
+        Math.abs(nearestTarget.price - drag.currentPrice) <= validDropDistance
+      )
+        saveLevelPosition(zone, nearestTarget.price);
+      else returnLevelToStart(zone, drag.startPrice);
+    }
     if (event.currentTarget.hasPointerCapture(event.pointerId))
       event.currentTarget.releasePointerCapture(event.pointerId);
     if (suppressZoneClickRef.current)
@@ -1421,12 +1499,16 @@ function App() {
         suppressZoneClickRef.current = false;
       }, 0);
   }
-  function cancelLevelDrag(event: React.PointerEvent<HTMLButtonElement>) {
+  function cancelLevelDrag(
+    event: React.PointerEvent<HTMLButtonElement>,
+    zone: ZoneRect,
+  ) {
     const drag = zoneDragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     zoneDragRef.current = null;
     suppressZoneClickRef.current = false;
     setDraggingLevelKey(null);
+    if (drag.moved) returnLevelToStart(zone, drag.startPrice);
   }
   function handleLevelClick(
     event: React.MouseEvent<HTMLButtonElement>,
@@ -1985,8 +2067,9 @@ function App() {
                       </div>
                     )}
                     <p className="zone-drag-hint">
-                      Drag a visible zone up or down. It stops at the next
-                      detected support or resistance level.
+                      Drag a visible zone up or down. Valid drops snap to the
+                      next same-type detected level; invalid drops return to
+                      their starting position.
                     </p>
                     {Object.keys(levelOverrides).length > 0 && (
                       <button
@@ -2050,17 +2133,17 @@ function App() {
             <div className="zone-layer">
               {zoneRects.map((zone) => (
                 <div
-                  className={`zone-rect ${zone.kind}${draggingLevelKey === zone.dragKey ? " dragging" : ""}`}
+                  className={`zone-rect ${zone.kind}${draggingLevelKey === zone.dragKey ? " dragging" : ""}${returningLevelKey === zone.dragKey ? " returning" : ""}`}
                   style={{ top: zone.top, height: zone.height }}
                   key={zone.dragKey}
                 >
                   <button
                     aria-label={`Drag ${zone.kind} ${zone.rank} at ${formatPrice(zone.price)} or click for details`}
-                    title="Drag vertically between adjacent levels · Click for details"
+                    title="Drag to another valid same-type level · Invalid drops return"
                     onPointerDown={(event) => startLevelDrag(event, zone)}
                     onPointerMove={(event) => moveLevelDrag(event, zone)}
-                    onPointerUp={finishLevelDrag}
-                    onPointerCancel={cancelLevelDrag}
+                    onPointerUp={(event) => finishLevelDrag(event, zone)}
+                    onPointerCancel={(event) => cancelLevelDrag(event, zone)}
                     onClick={(event) => handleLevelClick(event, zone)}
                   >
                     ↕ {zone.kind} {zone.rank} · {formatPrice(zone.price)} ·{" "}

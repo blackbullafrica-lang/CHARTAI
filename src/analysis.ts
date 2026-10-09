@@ -25,17 +25,33 @@ export function analyze(all:Candle[]):Analysis{
     if(neighbors.every(c=>cs[i].high>c.high))pivots.push({index:i,price:cs[i].high,kind:'high'});
     if(neighbors.every(c=>cs[i].low<c.low))pivots.push({index:i,price:cs[i].low,kind:'low'});
   }
-  // ATR-banded clustering avoids pretending an exact level is known.
+  // Cluster pivot lows and highs separately so a resistance always comes from
+  // confirmed swing highs and a support always comes from confirmed swing lows.
   const tolerance=Math.max(atr*0.7,last*0.002);
   const recent=pivots.filter(p=>p.index>=cs.length-180);
-  const clusters:{prices:number[];indices:number[]}[]=[];
-  for(const p of recent){
-    let found=clusters.find(c=>Math.abs(mean(c.prices)-p.price)<=tolerance);
-    if(!found){found={prices:[],indices:[]};clusters.push(found)}
-    found.prices.push(p.price);found.indices.push(p.index);
-  }
-  const levels=clusters.filter(c=>c.prices.length>=2).map(c=>({price:mean(c.prices),touches:c.prices.length,kind:(mean(c.prices)<last?'support':'resistance') as Level['kind']}))
-    .sort((a,b)=>Math.abs(a.price-last)-Math.abs(b.price-last)).slice(0,16).sort((a,b)=>a.price-b.price);
+  const clusterLevels=(source:Pivot[],kind:Level['kind'])=>{
+    const clusters:{prices:number[];indices:number[]}[]=[];
+    for(const p of source){
+      let found=clusters.find(c=>Math.abs(mean(c.prices)-p.price)<=tolerance);
+      if(!found){found={prices:[],indices:[]};clusters.push(found)}
+      found.prices.push(p.price);found.indices.push(p.index);
+    }
+    return clusters
+      .filter(c=>c.prices.length>=2)
+      .map(c=>({price:mean(c.prices),touches:c.prices.length,kind}))
+      .filter(level=>kind==='support'?level.price<last:level.price>last)
+      .sort((a,b)=>a.price-b.price);
+  };
+  // Keep both the extreme and nearest levels on each side. This preserves the
+  // lowest supports and highest resistances without losing nearby triggers.
+  const keepEdges=(candidates:Level[],limit=8)=>{
+    if(candidates.length<=limit)return candidates;
+    const edgeCount=Math.floor(limit/2);
+    return [...candidates.slice(0,edgeCount),...candidates.slice(-edgeCount)];
+  };
+  const supports=keepEdges(clusterLevels(recent.filter(p=>p.kind==='low'),'support'));
+  const resistances=keepEdges(clusterLevels(recent.filter(p=>p.kind==='high'),'resistance'));
+  const levels=[...supports,...resistances].sort((a,b)=>a.price-b.price);
   const highs=pivots.filter(p=>p.kind==='high').slice(-2),lows=pivots.filter(p=>p.kind==='low').slice(-2);
   let trend:Analysis['trend']='Mixed';let recentStructure='Insufficient confirmed pivots for trend classification';
   if(highs.length===2&&lows.length===2){
@@ -87,5 +103,5 @@ export function analyze(all:Candle[]):Analysis{
     orderBlocks.push({index:blockIndex,confirmedIndex:i,endIndex:invalidIndex>=0?i+1+invalidIndex:cs.length-1,low:blockLow,high:blockHigh,direction,mitigated:touchIndex>=0});
   }
   const uniqueBlocks=orderBlocks.filter((block,index,list)=>list.findIndex(candidate=>candidate.index===block.index&&candidate.direction===block.direction)===index).slice(-12);
-  return {last,atr,trend,levels,pivots:pivots.slice(-28),recentStructure,bullishTrigger:resistance?.price??null,bearishTrigger:support?.price??null,indicators:{ema20:ema(closes.slice(-80),20),ema50:ema(closes.slice(-150),50),sma200:mean(closes.slice(-200)),vwap50,rsi14:rsi(closes),macd,macdSignal},fibonacci,smartMoney:{fairValueGaps:fairValueGaps.slice(-20),orderBlocks:uniqueBlocks,structureEvents:structureEvents.slice(-16)}};
+  return {last,atr,trend,levels,pivots:pivots.slice(-48),recentStructure,bullishTrigger:resistance?.price??null,bearishTrigger:support?.price??null,indicators:{ema20:ema(closes.slice(-80),20),ema50:ema(closes.slice(-150),50),sma200:mean(closes.slice(-200)),vwap50,rsi14:rsi(closes),macd,macdSignal},fibonacci,smartMoney:{fairValueGaps:fairValueGaps.slice(-20),orderBlocks:uniqueBlocks,structureEvents:structureEvents.slice(-16)}};
 }
