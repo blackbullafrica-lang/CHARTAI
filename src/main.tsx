@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import {
   createChart,
   CandlestickSeries,
@@ -20,25 +21,74 @@ import { Root } from "protobufjs/light";
 import {
   Activity,
   BrainCircuit,
+  CandlestickChart,
   RefreshCcw,
   ScanLine,
   Layers,
   ChevronRight,
+  ChevronDown,
   SlidersHorizontal,
   GitBranch,
   Settings2,
   Search,
-  Sparkles,
   ShieldAlert,
   X,
   CircleHelp,
   MessageSquareText,
   Send,
   Trash2,
+  Wallet,
+  ArrowUpRight,
+  ArrowDownRight,
+  Users,
+  Radio,
+  Copy,
 } from "lucide-react";
-import { analyze, type Analysis, type Candle, type Level } from "./analysis";
+import {
+  analyze,
+  type Analysis,
+  type Candle,
+  type ChartPattern,
+  type Level,
+} from "./analysis";
+import {
+  buildRuleSignal,
+  DEFAULT_SIGNAL_FACTORS,
+  isSignalFactor,
+  SIGNAL_FACTORS,
+  type RuleSignal,
+  type SignalFactor,
+} from "./signals";
+import { AnimatedCompanion } from "./AnimatedCompanion";
+import { PatternThumbnail } from "./PatternThumbnail";
+import {
+  calculatePaperQuote,
+  PAPER_STORAGE_KEY,
+  paperPositionPnl,
+  readPaperPortfolio,
+  type PaperClosedTrade,
+  type PaperDirection,
+  type PaperDirectionMode,
+  type PaperPortfolio,
+  type PaperPosition,
+} from "./paperTrading";
 import "./style.css";
 const intervals = ["5m", "15m", "1h", "4h", "1d", "1w"];
+const signalFactorsStorageKey = "chart-ai.signal-factors";
+function readSavedSignalFactors(): SignalFactor[] {
+  try {
+    const saved: unknown = JSON.parse(
+      window.localStorage.getItem(signalFactorsStorageKey) ?? "null",
+    );
+    if (!Array.isArray(saved)) return [...DEFAULT_SIGNAL_FACTORS];
+    const selected = SIGNAL_FACTORS.filter((factor) =>
+      saved.some((value) => isSignalFactor(value) && value === factor.id),
+    ).map((factor) => factor.id);
+    return selected.length ? selected : [...DEFAULT_SIGNAL_FACTORS];
+  } catch {
+    return [...DEFAULT_SIGNAL_FACTORS];
+  }
+}
 const exchanges = [
   { id: "binance", name: "Binance Spot" },
   { id: "bybit", name: "Bybit Linear" },
@@ -47,12 +97,96 @@ const exchanges = [
   { id: "hyperliquid", name: "Hyperliquid Perps" },
   { id: "mexc", name: "MEXC Spot" },
 ];
+const marketCatalogStorageKey = "chart-ai.market-catalog.v1";
+function readSavedMarketCatalog(): Market[] {
+  try {
+    const saved: unknown = JSON.parse(
+      window.localStorage.getItem(marketCatalogStorageKey) ?? "null",
+    );
+    if (!Array.isArray(saved)) return [];
+    const validProviders = new Set(exchanges.map((exchange) => exchange.id));
+    return saved.filter(
+      (market): market is Market =>
+        Boolean(market) &&
+        typeof market === "object" &&
+        typeof market.symbol === "string" &&
+        /^[\p{L}\p{N}]{2,40}$/u.test(market.symbol) &&
+        typeof market.baseAsset === "string" &&
+        typeof market.quoteAsset === "string" &&
+        typeof market.provider === "string" &&
+        validProviders.has(market.provider),
+    );
+  } catch {
+    return [];
+  }
+}
+function mergeProviderMarkets(
+  current: Market[],
+  provider: string,
+  replacement: Market[],
+): Market[] {
+  const unique = new Map<string, Market>();
+  for (const market of current) {
+    if (market.provider !== provider)
+      unique.set(`${market.provider}:${market.symbol}`, market);
+  }
+  for (const market of replacement)
+    unique.set(`${provider}:${market.symbol}`, market);
+  return [...unique.values()].sort(
+    (a, b) =>
+      a.baseAsset.localeCompare(b.baseAsset) ||
+      a.quoteAsset.localeCompare(b.quoteAsset) ||
+      (a.provider || "").localeCompare(b.provider || ""),
+  );
+}
 type Market = {
   symbol: string;
   baseAsset: string;
   quoteAsset: string;
   apiSymbol?: string;
   provider?: string;
+};
+type MarketFailure = {
+  provider: string;
+  error: string;
+};
+type CopyProfile = {
+  id: string;
+  displayName: string;
+  isPublic: boolean;
+  currentTrade: { position: PaperPosition; accountBalance: number } | null;
+  realizedPnl: number;
+  totalTrades: number;
+  updatedAt: string;
+};
+type CopyFollow = {
+  traderId: string;
+  enabled: boolean;
+  copyScale: number;
+};
+type CopyTradeEvent = {
+  id: number;
+  traderId: string;
+  kind: "open" | "close";
+  trade: {
+    position?: PaperPosition;
+    accountBalance?: number;
+    positionId?: string;
+    exitPrice?: number;
+    closedAtTime?: number;
+    pnl?: number;
+    reason?: PaperClosedTrade["reason"];
+  };
+  createdAt: string;
+  displayName: string;
+};
+type CopySnapshot = {
+  me: CopyProfile;
+  traders: CopyProfile[];
+  follows: CopyFollow[];
+  events: CopyTradeEvent[];
+  cursor: number;
+  storageMode: "local-memory" | "persistent";
 };
 type IndicatorKey =
   | "ema20"
@@ -100,6 +234,10 @@ type FibLineRect = {
   price: number;
   name: string;
 };
+type PatternDrawing = {
+  segments: { x1: number; y1: number; x2: number; y2: number }[];
+  points: { x: number; y: number; label: string }[];
+};
 type InfoDetail = { title: string; description: string; facts?: string[] };
 type AiProvider = "gemini" | "venice";
 type ChatMessage = {
@@ -107,6 +245,30 @@ type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   provider?: AiProvider;
+};
+type DailyStats = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+type RangePeriod = "off" | "daily" | "weekly" | "monthly" | "yearly";
+type CandleReading = {
+  name: string;
+  direction: "bullish" | "bearish" | "neutral";
+  description: string;
+};
+type SelectedCandle = {
+  candle: Candle;
+  index: number;
+  readings: CandleReading[];
+};
+const rangePeriodLabels: Record<Exclude<RangePeriod, "off">, string> = {
+  daily: "DAILY",
+  weekly: "WEEKLY",
+  monthly: "MONTHLY",
+  yearly: "YEARLY",
 };
 const indicatorLabels: Record<IndicatorKey, string> = {
   ema20: "EMA 20",
@@ -152,7 +314,7 @@ const conceptInfo: Record<ConceptKey, InfoDetail> = {
   fibonacci: {
     title: "Fibonacci retracement",
     description:
-      "Retracement levels are measured between the most recent significant swing extremes. They are reference areas where reactions may occur, not guaranteed support or resistance.",
+      "Auto follows the detected swing. Long maps levels from the swing low toward the high; Short reverses the anchors from high to low. These are reaction areas, not guaranteed support or resistance.",
   },
   fairValueGaps: {
     title: "Fair value gap",
@@ -189,6 +351,264 @@ function fibName(ratio: number, direction: "bullish" | "bearish") {
 }
 function formatPrice(price: number) {
   return price.toLocaleString(undefined, { maximumFractionDigits: 8 });
+}
+function formatMoney(amount: number) {
+  return amount.toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2,
+  });
+}
+function candleChangePercent(candle: Pick<Candle, "open" | "close">) {
+  return candle.open
+    ? ((candle.close - candle.open) / candle.open) * 100
+    : 0;
+}
+function formatPercent(value: number) {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+function CandleIllustration({ candle }: { candle: Candle }) {
+  const isBullish = candle.close >= candle.open;
+  const color = isBullish ? "#32c997" : "#ed707b";
+  const range = candle.high - candle.low;
+  const yAt = (price: number) =>
+    range > 0 ? 7 + ((candle.high - price) / range) * 54 : 34;
+  const openY = yAt(candle.open);
+  const closeY = yAt(candle.close);
+  const bodyTop = Math.min(openY, closeY);
+  const bodyHeight = Math.max(3, Math.abs(closeY - openY));
+  return (
+    <svg
+      className={`candle-illustration${isBullish ? " bullish" : " bearish"}`}
+      viewBox="0 0 64 72"
+      role="img"
+      aria-label={`${isBullish ? "Bullish" : "Bearish"} candle with high ${formatPrice(candle.high)}, open ${formatPrice(candle.open)}, close ${formatPrice(candle.close)}, and low ${formatPrice(candle.low)}`}
+    >
+      <title>Selected candle shape drawn from its OHLC prices</title>
+      <rect className="candle-mini-background" x="1" y="1" width="62" height="70" rx="7" />
+      <path className="candle-mini-guides" d="M7 17H57 M7 36H57 M7 55H57" />
+      <line x1="32" y1={yAt(candle.high)} x2="32" y2={yAt(candle.low)} stroke={color} strokeWidth="2" />
+      <line x1="18" y1={openY} x2="24" y2={openY} stroke={color} strokeWidth="2" />
+      <line x1="40" y1={closeY} x2="46" y2={closeY} stroke={color} strokeWidth="2" />
+      <rect x="24" y={bodyTop} width="16" height={bodyHeight} rx="1.5" fill={color} />
+    </svg>
+  );
+}
+type InsightSection = { title: string; lines: string[] };
+function parseInsightText(text: string) {
+  const intro: string[] = [];
+  const sections: InsightSection[] = [];
+  let current: InsightSection | null = null;
+  const lines = text.replace(/\r/g, "").split("\n");
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || /^```/.test(line)) continue;
+    const markdownHeading =
+      line.match(/^#{1,4}\s+(.+?)\s*#*$/) ??
+      line.match(/^\*\*(.+?)\*\*:?\s*$/) ??
+      line.match(/^__(.+?)__:?\s*$/);
+    const colonHeading = line.match(/^([A-Z][A-Za-z0-9 /&'’()-]{1,42}):\s*$/);
+    const title = markdownHeading?.[1] ?? colonHeading?.[1];
+    if (title) {
+      current = { title: title.trim().replace(/:$/, ""), lines: [] };
+      sections.push(current);
+      continue;
+    }
+    const cleanLine = line
+      .replace(/^\s*(?:[-*•]|\d+[.)])\s+/, "")
+      .replace(/\*\*(.*?)\*\*/g, "$1")
+      .replace(/__(.*?)__/g, "$1")
+      .replace(/`([^`]+)`/g, "$1")
+      .trim();
+    if (!cleanLine) continue;
+    (current ? current.lines : intro).push(cleanLine);
+  }
+  return { intro, sections };
+}
+function ChartInsight({ text }: { text: string }) {
+  const parsed = parseInsightText(text);
+  const bias = parsed.sections.find((section) => /^bias$/i.test(section.title));
+  const biasText = bias?.lines.join(" ") ?? "";
+  const direction = /\bbullish\b|\bbuy\b|\blong\b/i.test(biasText)
+    ? "bullish"
+    : /\bbearish\b|\bsell\b|\bshort\b/i.test(biasText)
+      ? "bearish"
+      : "";
+  const sideLabel = direction === "bullish" ? "LONG" : direction === "bearish" ? "SHORT" : biasText;
+  const intro = parsed.intro.filter(
+    (line) => !/^educational signal\b/i.test(line),
+  );
+  const sections = parsed.sections.filter((section) => section !== bias);
+  return (
+    <section className="insights insight-card" aria-label="Chart explanation">
+      <header className="insight-heading">
+        <span className="insight-icon"><BrainCircuit size={15} aria-hidden="true" /></span>
+        <span className="insight-heading-copy">
+          <strong>Chart analysis</strong>
+          <small>Educational market scenario</small>
+        </span>
+        {biasText && (
+          <span className={`insight-bias ${direction}`}>
+            {sideLabel}
+          </span>
+        )}
+      </header>
+      {sections.length > 0 ? (
+        <>
+          {intro.length > 0 && (
+            <p className="insight-intro">{intro.join(" ")}</p>
+          )}
+          <div className="insight-sections">
+            {sections.map((section, index) => {
+              const title = section.title.toLowerCase();
+              const wide = /structure|confirmation|required|risk note/.test(title);
+              const risk = /risk note/.test(title);
+              return (
+                <article
+                  className={`insight-section${wide ? " wide" : ""}${risk ? " risk" : ""}`}
+                  key={`${section.title}-${index}`}
+                >
+                  <h4>{section.title}</h4>
+                  {section.lines.map((line, lineIndex) => (
+                    <p key={`${lineIndex}-${line}`}>{line}</p>
+                  ))}
+                </article>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <div className="insight-plain">
+          {intro.map((line, index) => <p key={`${index}-${line}`}>{line}</p>)}
+        </div>
+      )}
+    </section>
+  );
+}
+function aggregateCandleRange(candles: Candle[]): DailyStats | null {
+  if (!candles.length) return null;
+  const ordered = [...candles].sort((a, b) => a.time - b.time);
+  return {
+    time: ordered[0].time,
+    open: ordered[0].open,
+    high: Math.max(...ordered.map((candle) => candle.high)),
+    low: Math.min(...ordered.map((candle) => candle.low)),
+    close: ordered[ordered.length - 1].close,
+  };
+}
+function recordPaperClose(
+  portfolio: PaperPortfolio,
+  position: PaperPosition,
+  exitPrice: number,
+  closedAtTime: number,
+  reason: PaperClosedTrade["reason"],
+): PaperPortfolio {
+  const trade: PaperClosedTrade = {
+    ...position,
+    exitPrice,
+    pnl: paperPositionPnl(position, exitPrice),
+    closedAtTime,
+    reason,
+  };
+  return {
+    balance: portfolio.balance + trade.pnl,
+    openPosition: null,
+    history: [trade, ...portfolio.history].slice(0, 50),
+  };
+}
+function recognizeCandlestick(candles: Candle[], index: number): CandleReading[] {
+  const candle = candles[index];
+  if (!candle) return [];
+  const readings: CandleReading[] = [];
+  const add = (reading: CandleReading) => {
+    if (!readings.some((current) => current.name === reading.name))
+      readings.push(reading);
+  };
+  const range = Math.max(candle.high - candle.low, Number.EPSILON);
+  const body = Math.abs(candle.close - candle.open);
+  const upperWick = candle.high - Math.max(candle.open, candle.close);
+  const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+  const bodyRatio = body / range;
+  const bullish = candle.close > candle.open;
+  const direction = bullish ? "bullish" : candle.close < candle.open ? "bearish" : "neutral";
+  const earlier = candles[Math.max(0, index - 5)];
+  const priorMove = index > 0 ? candles[index - 1].close - earlier.close : 0;
+
+  if (range <= Number.EPSILON * 10) {
+    add({ name: "Four-price doji", direction: "neutral", description: "Open, high, low and close are effectively identical." });
+  } else if (bodyRatio <= 0.1) {
+    if (lowerWick >= range * 0.62 && upperWick <= range * 0.1)
+      add({ name: "Dragonfly doji", direction: "bullish", description: "A doji near the high with a long lower wick, showing strong rejection below." });
+    else if (upperWick >= range * 0.62 && lowerWick <= range * 0.1)
+      add({ name: "Gravestone doji", direction: "bearish", description: "A doji near the low with a long upper wick, showing strong rejection above." });
+    else if (upperWick >= range * 0.3 && lowerWick >= range * 0.3)
+      add({ name: "Long-legged doji", direction: "neutral", description: "Long wicks on both sides show a wide battle with little net body." });
+    else
+      add({ name: "Doji", direction: "neutral", description: "Open and close are nearly equal, signalling short-term indecision." });
+  } else if (bodyRatio >= 0.84) {
+    add({
+      name: bullish ? "Bullish marubozu" : "Bearish marubozu",
+      direction,
+      description: "The real body controls most of the full range with very small opposing wicks.",
+    });
+  } else if (lowerWick >= body * 2.1 && upperWick <= body * 0.65) {
+    add({
+      name: priorMove <= 0 ? "Hammer" : "Hanging man",
+      direction: priorMove <= 0 ? "bullish" : "bearish",
+      description: "A compact body above a long lower wick marks forceful rejection of lower prices.",
+    });
+  } else if (upperWick >= body * 2.1 && lowerWick <= body * 0.65) {
+    add({
+      name: priorMove <= 0 ? "Inverted hammer" : "Shooting star",
+      direction: priorMove <= 0 ? "bullish" : "bearish",
+      description: "A compact body below a long upper wick marks forceful rejection of higher prices.",
+    });
+  } else if (bodyRatio <= 0.34 && upperWick >= body * 0.7 && lowerWick >= body * 0.7) {
+    add({ name: "Spinning top", direction: "neutral", description: "A small body with meaningful wicks on both sides shows balanced pressure." });
+  } else {
+    add({
+      name: `${bullish ? "Bullish" : "Bearish"} ${bodyRatio >= 0.58 ? "long" : "standard"} candle`,
+      direction,
+      description: `${bullish ? "Buyers" : "Sellers"} closed the candle away from its open with ${bodyRatio >= 0.58 ? "strong" : "moderate"} body control.`,
+    });
+  }
+
+  const previous = candles[index - 1];
+  if (previous) {
+    const previousBullish = previous.close > previous.open;
+    const currentHighBody = Math.max(candle.open, candle.close);
+    const currentLowBody = Math.min(candle.open, candle.close);
+    const previousHighBody = Math.max(previous.open, previous.close);
+    const previousLowBody = Math.min(previous.open, previous.close);
+    if (bullish && !previousBullish && currentLowBody <= previousLowBody && currentHighBody >= previousHighBody)
+      add({ name: "Bullish engulfing", direction: "bullish", description: "The bullish body fully engulfs the previous bearish body." });
+    if (!bullish && previousBullish && currentLowBody <= previousLowBody && currentHighBody >= previousHighBody)
+      add({ name: "Bearish engulfing", direction: "bearish", description: "The bearish body fully engulfs the previous bullish body." });
+    if (currentLowBody >= previousLowBody && currentHighBody <= previousHighBody)
+      add({ name: bullish ? "Bullish harami" : "Bearish harami", direction, description: "The current real body sits inside the previous candle's body." });
+    const tolerance = Math.max(range, previous.high - previous.low) * 0.06;
+    if (Math.abs(candle.high - previous.high) <= tolerance && previousBullish && !bullish)
+      add({ name: "Tweezer top", direction: "bearish", description: "Two candles rejected almost the same high." });
+    if (Math.abs(candle.low - previous.low) <= tolerance && !previousBullish && bullish)
+      add({ name: "Tweezer bottom", direction: "bullish", description: "Two candles rejected almost the same low." });
+    const previousMidpoint = (previous.open + previous.close) / 2;
+    if (!previousBullish && bullish && candle.open <= previous.close && candle.close > previousMidpoint && candle.close < previous.open)
+      add({ name: "Piercing line", direction: "bullish", description: "A bullish recovery closes beyond the midpoint of the prior bearish body." });
+    if (previousBullish && !bullish && candle.open >= previous.close && candle.close < previousMidpoint && candle.close > previous.open)
+      add({ name: "Dark cloud cover", direction: "bearish", description: "A bearish reversal closes below the midpoint of the prior bullish body." });
+  }
+
+  const twoBack = candles[index - 2];
+  if (twoBack && previous) {
+    const firstBody = Math.abs(twoBack.close - twoBack.open);
+    const middleBody = Math.abs(previous.close - previous.open);
+    const firstMidpoint = (twoBack.open + twoBack.close) / 2;
+    if (twoBack.close < twoBack.open && middleBody <= firstBody * 0.45 && bullish && candle.close > firstMidpoint)
+      add({ name: "Morning star", direction: "bullish", description: "A three-candle transition from bearish momentum through indecision into bullish recovery." });
+    if (twoBack.close > twoBack.open && middleBody <= firstBody * 0.45 && !bullish && candle.close < firstMidpoint)
+      add({ name: "Evening star", direction: "bearish", description: "A three-candle transition from bullish momentum through indecision into bearish reversal." });
+  }
+  return readings.slice(0, 5);
 }
 const bybitIntervals: Record<string, string> = {
   "5m": "5",
@@ -321,15 +741,36 @@ function donchianLines(candles: Candle[], period = 20) {
   return { upper, middle, lower };
 }
 function App() {
-  const [provider, setProvider] = useState("mexc");
+  const [provider, setProvider] = useState("aster");
   const [reload, setReload] = useState(0);
-  const [symbol, setSymbol] = useState("BTCUSDT");
-  const [interval, setIntervalValue] = useState("4h");
+  const [symbol, setSymbol] = useState("SOLUSDT");
+  const [interval, setIntervalValue] = useState("5m");
   const [candles, setCandles] = useState<Candle[]>([]);
+  const [timeframeChanges, setTimeframeChanges] = useState<
+    Record<string, number>
+  >({});
+  const [dailyStats, setDailyStats] = useState<DailyStats | null>(null);
+  const [weeklyStats, setWeeklyStats] = useState<DailyStats | null>(null);
+  const [dailyHistory, setDailyHistory] = useState<Candle[]>([]);
+  const [rangeLevelPeriod, setRangeLevelPeriod] =
+    useState<RangePeriod>("off");
+  const [selectedCandle, setSelectedCandle] =
+    useState<SelectedCandle | null>(null);
+  const [focusedPatternName, setFocusedPatternName] = useState<string | null>(
+    null,
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [markets, setMarkets] = useState<Market[]>([]);
-  const [marketsLoading, setMarketsLoading] = useState(true);
+  const [initialMarketCatalog] = useState(readSavedMarketCatalog);
+  const [markets, setMarkets] = useState<Market[]>(initialMarketCatalog);
+  const [marketsLoading, setMarketsLoading] = useState(
+    initialMarketCatalog.length === 0,
+  );
+  const [marketResolvedProviders, setMarketResolvedProviders] = useState<
+    string[]
+  >(() => [...new Set(initialMarketCatalog.map((market) => market.provider || ""))]);
+  const [marketFailures, setMarketFailures] = useState<MarketFailure[]>([]);
+  const [marketScope, setMarketScope] = useState("all");
   const [marketQuery, setMarketQuery] = useState("");
   const [marketMenu, setMarketMenu] = useState(false);
   const [showSupportZones, setShowSupportZones] = useState(false);
@@ -366,16 +807,44 @@ function App() {
     structure: false,
   });
   const [conceptMenu, setConceptMenu] = useState(false);
+  const [fibDirectionMode, setFibDirectionMode] =
+    useState<PaperDirectionMode>("auto");
   const [conceptRects, setConceptRects] = useState<ConceptRect[]>([]);
   const [fibLines, setFibLines] = useState<FibLineRect[]>([]);
+  const [patternDrawing, setPatternDrawing] =
+    useState<PatternDrawing | null>(null);
   const [aiText, setAiText] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [live, setLive] = useState(false);
   const [signalModal, setSignalModal] = useState(false);
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
-  const [signalLoading, setSignalLoading] = useState(false);
-  const [signalText, setSignalText] = useState("");
+  const [signalPlan, setSignalPlan] = useState<RuleSignal | null>(null);
   const [signalError, setSignalError] = useState("");
+  const [signalFactors, setSignalFactors] = useState<SignalFactor[]>(
+    readSavedSignalFactors,
+  );
+  const [signalSettingsOpen, setSignalSettingsOpen] = useState(false);
+  const [paperPortfolio, setPaperPortfolio] =
+    useState<PaperPortfolio>(readPaperPortfolio);
+  const [copySnapshot, setCopySnapshot] = useState<CopySnapshot | null>(null);
+  const [copyNameDraft, setCopyNameDraft] = useState("");
+  const [copyShareDraft, setCopyShareDraft] = useState(false);
+  const [copySaving, setCopySaving] = useState(false);
+  const [copyError, setCopyError] = useState("");
+  const [copyStatus, setCopyStatus] = useState("Connecting to demo traders…");
+  const [copyScaleDrafts, setCopyScaleDrafts] = useState<Record<string, number>>({});
+  const [paperDirection, setPaperDirection] =
+    useState<PaperDirection>("LONG");
+  const [paperEntry, setPaperEntry] = useState("");
+  const [paperStop, setPaperStop] = useState("");
+  const [paperTarget, setPaperTarget] = useState("");
+  const [paperRiskPercent, setPaperRiskPercent] = useState("1");
+  const [paperLeverage, setPaperLeverage] = useState("3");
+  const [paperMaintenanceMarginPercent, setPaperMaintenanceMarginPercent] =
+    useState("0.5");
+  const [paperFeePercent, setPaperFeePercent] = useState("0.05");
+  const [paperError, setPaperError] = useState("");
+  const [paperDockExpanded, setPaperDockExpanded] = useState(false);
   const [chatProvider, setChatProvider] = useState<AiProvider>("venice");
   const [chatProviders, setChatProviders] = useState<
     Record<AiProvider, boolean>
@@ -404,9 +873,17 @@ function App() {
   } | null>(null);
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const levelPriceLinesRef = useRef<IPriceLine[]>([]);
+  const signalPriceLinesRef = useRef<IPriceLine[]>([]);
+  const paperPriceLinesRef = useRef<IPriceLine[]>([]);
   const candlesRef = useRef<Candle[]>([]);
   const marketsRef = useRef<Market[]>([]);
+  const paperPortfolioRef = useRef(paperPortfolio);
+  const copySnapshotRef = useRef<CopySnapshot | null>(null);
+  const copyCursorRef = useRef<number | null>(null);
+  const copySyncBusyRef = useRef(false);
+  const copyPublishQueueRef = useRef<Promise<void>>(Promise.resolve());
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const zoneDragRef = useRef<{
     pointerId: number;
     key: string;
@@ -416,6 +893,168 @@ function App() {
     moved: boolean;
   } | null>(null);
   const suppressZoneClickRef = useRef(false);
+  function replacePaperPortfolio(next: PaperPortfolio) {
+    paperPortfolioRef.current = next;
+    setPaperPortfolio(next);
+  }
+  function applyCopiedPosition(
+    trader: CopyProfile,
+    shared: { position: PaperPosition; accountBalance: number },
+    copyScale: number,
+  ) {
+    const source = shared.position;
+    const currentPortfolio = paperPortfolioRef.current;
+    if (currentPortfolio.openPosition?.copiedFrom?.positionId === source.id) {
+      setCopyStatus(`Copying ${trader.displayName} · ${source.symbol}`);
+      return true;
+    }
+    if (currentPortfolio.openPosition) {
+      setCopyStatus(`Skipped ${trader.displayName}'s ${source.symbol} entry · close your open demo position first.`);
+      return false;
+    }
+    const sourceRiskPercent =
+      (Number(source.riskAmount) / Math.max(1, Number(shared.accountBalance))) *
+      Math.max(10, Math.min(200, copyScale));
+    const riskPercent = Math.max(0.1, Math.min(5, sourceRiskPercent));
+    const quoteResult = calculatePaperQuote({
+      direction: source.direction,
+      entry: source.entry,
+      stop: source.stop,
+      target: source.target,
+      riskPercent,
+      leverage: Math.max(1, Math.min(50, Number(source.leverage))),
+      maintenanceMarginPercent: 0.5,
+      feePercent: Math.max(0, Math.min(1, Number(source.feeRate) * 100)),
+      balance: currentPortfolio.balance,
+    });
+    if (!quoteResult.quote) {
+      setCopyStatus(`Could not copy ${trader.displayName}'s trade: ${quoteResult.error}`);
+      return false;
+    }
+    const copiedPosition: PaperPosition = {
+      ...source,
+      id: `copy-${trader.id}-${source.id}`.slice(0, 120),
+      quantity: quoteResult.quote.quantity,
+      margin: quoteResult.quote.margin,
+      liquidationPrice: quoteResult.quote.liquidationPrice,
+      riskAmount: quoteResult.quote.stopLoss,
+      copiedFrom: {
+        traderId: trader.id,
+        traderName: trader.displayName,
+        positionId: source.id,
+      },
+    };
+    replacePaperPortfolio({ ...currentPortfolio, openPosition: copiedPosition });
+    setCopyStatus(`Copied ${source.direction} ${source.symbol} from ${trader.displayName}.`);
+    return true;
+  }
+  function applyCopyClose(event: CopyTradeEvent) {
+    const position = paperPortfolioRef.current.openPosition;
+    if (
+      !position?.copiedFrom ||
+      position.copiedFrom.traderId !== event.traderId ||
+      position.copiedFrom.positionId !== event.trade.positionId ||
+      !Number.isFinite(Number(event.trade.exitPrice))
+    ) return;
+    const next = recordPaperClose(
+      paperPortfolioRef.current,
+      position,
+      Number(event.trade.exitPrice),
+      Number(event.trade.closedAtTime || Date.now() / 1000),
+      event.trade.reason || "Closed manually",
+    );
+    replacePaperPortfolio(next);
+    setCopyStatus(`Closed copied ${position.direction} ${position.symbol} from ${event.displayName}.`);
+  }
+  async function syncCopyTrading() {
+    if (copySyncBusyRef.current) return;
+    copySyncBusyRef.current = true;
+    const isBootstrap = copyCursorRef.current === null;
+    try {
+      const after = copyCursorRef.current;
+      const response = await fetch(
+        after === null ? "/api/copy-trading" : `/api/copy-trading?after=${after}`,
+        { cache: "no-store", credentials: "same-origin" },
+      );
+      const body = await response.json() as CopySnapshot & { error?: string };
+      if (!response.ok) throw new Error(body.error || "Copy trading unavailable");
+      const firstSnapshot = copySnapshotRef.current === null;
+      copySnapshotRef.current = body;
+      setCopySnapshot(body);
+      setCopyNameDraft((current) => current || body.me.displayName);
+      if (firstSnapshot) setCopyShareDraft(body.me.isPublic);
+      setCopyScaleDrafts((current) => {
+        const next = { ...current };
+        for (const follow of body.follows)
+          if (next[follow.traderId] === undefined)
+            next[follow.traderId] = follow.copyScale;
+        return next;
+      });
+      if (isBootstrap) {
+        copyCursorRef.current = body.cursor;
+      } else {
+        const sortedEvents = [...body.events].sort((a, b) => a.id - b.id);
+        for (const event of sortedEvents) {
+          if (event.kind === "open") {
+            const follow = body.follows.find(
+              (item) => item.traderId === event.traderId && item.enabled,
+            );
+            const trader = body.traders.find((item) => item.id === event.traderId);
+            if (follow && trader && event.trade.position && event.trade.accountBalance)
+              applyCopiedPosition(
+                trader,
+                {
+                  position: event.trade.position,
+                  accountBalance: event.trade.accountBalance,
+                },
+                follow.copyScale,
+              );
+          } else {
+            applyCopyClose(event);
+          }
+        }
+        copyCursorRef.current = Math.max(
+          after || 0,
+          ...sortedEvents.map((event) => event.id),
+          body.cursor,
+        );
+      }
+      setCopyError("");
+      setCopyStatus((current) =>
+        current.startsWith("Copied ") || current.startsWith("Closed copied ") || current.startsWith("Skipped ")
+          ? current
+          : "Live · trader updates every 2.5 seconds",
+      );
+    } catch (error) {
+      setCopyError(error instanceof Error ? error.message : "Copy trading is unavailable.");
+      setCopyStatus("Reconnect to demo traders");
+    } finally {
+      copySyncBusyRef.current = false;
+    }
+  }
+  async function publishCopyEvent(
+    kind: "open" | "close",
+    trade: CopyTradeEvent["trade"],
+  ) {
+    const send = async () => {
+      if (!copySnapshotRef.current?.me.isPublic) return;
+      try {
+        const response = await fetch("/api/copy-trading/event", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ kind, trade }),
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || "Trade could not be shared.");
+      } catch (error) {
+        setCopyError(error instanceof Error ? error.message : "Trade could not be shared.");
+        setCopyStatus("Trade sharing needs attention");
+      }
+    };
+    copyPublishQueueRef.current = copyPublishQueueRef.current.then(send, send);
+    await copyPublishQueueRef.current;
+  }
   const analysis = useMemo(() => {
     try {
       return candles.length ? analyze(candles) : null;
@@ -423,6 +1062,39 @@ function App() {
       return null;
     }
   }, [candles]);
+  const fibonacciForDisplay = useMemo(() => {
+    const fib = analysis?.fibonacci;
+    if (!fib || fibDirectionMode === "auto") return fib;
+    const completed = candles.filter((candle) => candle.closed);
+    const windowStart = Math.max(0, completed.length - 140);
+    const lowOffset = completed.findIndex(
+      (candle, index) => index >= windowStart && candle.low === fib.low,
+    );
+    const highOffset = completed.findIndex(
+      (candle, index) => index >= windowStart && candle.high === fib.high,
+    );
+    const lowIndex = lowOffset >= 0 ? lowOffset : fib.startIndex;
+    const highIndex = highOffset >= 0 ? highOffset : fib.endIndex;
+    const direction: "bullish" | "bearish" =
+      fibDirectionMode === "long" ? "bullish" : "bearish";
+    const range = fib.high - fib.low;
+    return {
+      ...fib,
+      direction,
+      startIndex: direction === "bullish" ? lowIndex : highIndex,
+      endIndex: direction === "bullish" ? highIndex : lowIndex,
+      levels: fib.levels.map((level) => ({
+        ...level,
+        price:
+          direction === "bullish"
+            ? fib.high - range * level.ratio
+            : fib.low + range * level.ratio,
+      })),
+    };
+  }, [analysis, candles, fibDirectionMode]);
+  const focusedPattern =
+    analysis?.patterns.find((pattern) => pattern.name === focusedPatternName) ??
+    null;
   const supportLevels = useMemo(
     () =>
       analysis?.levels
@@ -486,6 +1158,53 @@ function App() {
     selectedSupportRanks,
     selectedResistanceRanks,
   ]);
+  const rangeStats = useMemo(() => {
+    const source = dailyHistory.length ? dailyHistory : candles;
+    const latestSource = source[source.length - 1];
+    const reference = new Date((latestSource?.time ?? Date.now() / 1000) * 1000);
+    const dayStart = Date.UTC(
+      reference.getUTCFullYear(),
+      reference.getUTCMonth(),
+      reference.getUTCDate(),
+    );
+    const weekStart =
+      dayStart - ((reference.getUTCDay() + 6) % 7) * 24 * 60 * 60 * 1000;
+    const monthStart = Date.UTC(
+      reference.getUTCFullYear(),
+      reference.getUTCMonth(),
+      1,
+    );
+    const yearStart = Date.UTC(reference.getUTCFullYear(), 0, 1);
+    const firstSourceTime = source[0]?.time ?? Infinity;
+    const hasYearCoverage =
+      Boolean(dailyHistory.length) ||
+      firstSourceTime * 1000 <= yearStart ||
+      candles.length < 500;
+    return {
+      daily:
+        dailyStats ||
+        aggregateCandleRange(
+          source.filter((candle) => candle.time * 1000 >= dayStart),
+        ),
+      weekly:
+        weeklyStats ||
+        aggregateCandleRange(
+          source.filter((candle) => candle.time * 1000 >= weekStart),
+        ),
+      monthly: aggregateCandleRange(
+        source.filter((candle) => candle.time * 1000 >= monthStart),
+      ),
+      yearly: hasYearCoverage
+        ? aggregateCandleRange(
+            source.filter((candle) => candle.time * 1000 >= yearStart),
+          )
+        : null,
+    };
+  }, [candles, dailyHistory, dailyStats, weeklyStats]);
+  const activeRangeStats =
+    rangeLevelPeriod === "off" ? null : rangeStats[rangeLevelPeriod];
+  const activeRangeLabel =
+    rangeLevelPeriod === "off" ? null : rangePeriodLabels[rangeLevelPeriod];
   const selectedMarket = useMemo(
     () =>
       markets.find(
@@ -493,27 +1212,83 @@ function App() {
       ),
     [markets, provider, symbol],
   );
-  const marketMatches = useMemo(() => {
+  const marketsInScope = useMemo(
+    () =>
+      marketScope === "all"
+        ? markets
+        : markets.filter((market) => market.provider === marketScope),
+    [markets, marketScope],
+  );
+  const filteredMarkets = useMemo(() => {
     const query = marketQuery.trim().toUpperCase();
-    return (
-      query
-        ? markets.filter((market) =>
-            `${market.symbol} ${market.baseAsset}/${market.quoteAsset}`
-              .toUpperCase()
-              .includes(query),
-          )
-        : markets
-    ).slice(0, 120);
-  }, [markets, marketQuery]);
+    return query
+      ? marketsInScope.filter((market) =>
+          `${market.symbol} ${market.baseAsset}/${market.quoteAsset}`
+            .toUpperCase()
+            .includes(query),
+        )
+      : marketsInScope;
+  }, [marketsInScope, marketQuery]);
+  const marketMatches = useMemo(
+    () => filteredMarkets.slice(0, 160),
+    [filteredMarkets],
+  );
+  const loadedMarketProviderCount = new Set(
+    markets.map((market) => market.provider),
+  ).size;
+  const marketFailuresInScope = marketScope === "all"
+    ? marketFailures
+    : marketFailures.filter((failure) => failure.provider === marketScope);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        signalFactorsStorageKey,
+        JSON.stringify(signalFactors),
+      );
+    } catch {
+      // Signal preferences still work for this session when storage is unavailable.
+    }
+  }, [signalFactors]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        PAPER_STORAGE_KEY,
+        JSON.stringify(paperPortfolio),
+      );
+    } catch {
+      // Demo trading remains usable in this session when storage is unavailable.
+    }
+  }, [paperPortfolio]);
   useEffect(() => {
     setLevelOverrides({});
     setDraggingLevelKey(null);
     setReturningLevelKey(null);
+    setFocusedPatternName(null);
+    setPaperEntry("");
+    setPaperStop("");
+    setPaperTarget("");
+    setPaperError("");
     zoneDragRef.current = null;
   }, [provider, symbol, interval]);
   useEffect(() => {
     marketsRef.current = markets;
   }, [markets]);
+  useEffect(() => {
+    if (!markets.length) return;
+    try {
+      window.localStorage.setItem(
+        marketCatalogStorageKey,
+        JSON.stringify(markets),
+      );
+    } catch {
+      // The live exchange catalog remains usable if browser storage is unavailable.
+    }
+  }, [markets]);
+  useEffect(() => {
+    void syncCopyTrading();
+    const timer = window.setInterval(() => void syncCopyTrading(), 2500);
+    return () => window.clearInterval(timer);
+  }, []);
   useEffect(() => {
     let cancelled = false;
     fetch("/api/ai/providers")
@@ -546,35 +1321,105 @@ function App() {
   }, [chatMessages, chatLoading]);
   useEffect(() => {
     let cancelled = false;
-    setMarketsLoading(true);
-    setMarkets([]);
+    const retryTimers = new Map<string, number>();
+    const controller = new AbortController();
     setMarketQuery("");
     setMarketMenu(false);
-    fetch("/api/markets?provider=all")
-      .then(async (response) => {
-        const body = await response.json();
-        if (!response.ok) throw new Error(body.error || "Markets unavailable");
-        return body.markets as Market[];
-      })
-      .then((next) => {
-        if (!cancelled) {
-          setMarkets(next);
-          setMarketsLoading(false);
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setMarketsLoading(false);
-          setError(e instanceof Error ? e.message : "Failed to load markets");
-        }
+    const loadProviderMarkets = async (providerId: string) => {
+      const requestController = new AbortController();
+      const abortWithParent = () => requestController.abort();
+      controller.signal.addEventListener("abort", abortWithParent, {
+        once: true,
       });
+      const timeout = window.setTimeout(() => requestController.abort(), 22000);
+      try {
+        const response = await fetch(
+          `/api/markets?provider=${encodeURIComponent(providerId)}`,
+          { signal: requestController.signal },
+        );
+        const body = await response.json() as {
+          markets?: unknown;
+          error?: string;
+        };
+        if (!response.ok)
+          throw new Error(body.error || `${providerId} markets unavailable`);
+        if (cancelled) return;
+        const next = (Array.isArray(body.markets) ? body.markets : []).filter(
+          (market): market is Market =>
+            Boolean(market) &&
+            typeof market === "object" &&
+            typeof market.symbol === "string" &&
+            /^[\p{L}\p{N}]{2,40}$/u.test(market.symbol) &&
+            typeof market.baseAsset === "string" &&
+            typeof market.quoteAsset === "string",
+        ).map((market) => ({ ...market, provider: providerId }));
+        if (!next.length)
+          throw new Error(`${providerId} returned no active coin pairs`);
+        setMarkets((current) =>
+          mergeProviderMarkets(current, providerId, next),
+        );
+        setMarketFailures((current) =>
+          current.filter(
+            (failure) =>
+              failure.provider !== providerId && failure.provider !== "catalog",
+          ),
+        );
+        setMarketResolvedProviders((current) =>
+          current.includes(providerId) ? current : [...current, providerId],
+        );
+        setMarketsLoading(false);
+        return true;
+      } catch (reason) {
+        if (cancelled || controller.signal.aborted) return;
+        setMarketsLoading(false);
+        setMarketResolvedProviders((current) =>
+          current.includes(providerId) ? current : [...current, providerId],
+        );
+        setMarketFailures((current) => [
+          ...current.filter(
+            (failure) =>
+              failure.provider !== providerId && failure.provider !== "catalog",
+          ),
+          {
+            provider: providerId,
+            error:
+              reason instanceof Error
+                ? reason.message
+                : `${providerId} market catalog is unavailable`,
+          },
+        ]);
+        return false;
+      } finally {
+        window.clearTimeout(timeout);
+        controller.signal.removeEventListener("abort", abortWithParent);
+      }
+    };
+    const refreshProvider = async (providerId: string) => {
+      setMarketsLoading(marketsRef.current.length === 0);
+      const loaded = await loadProviderMarkets(providerId);
+      if (cancelled) return;
+      retryTimers.set(
+        providerId,
+        window.setTimeout(
+          () => void refreshProvider(providerId),
+          loaded ? 300000 : 30000,
+        ),
+      );
+    };
+    for (const exchange of exchanges) void refreshProvider(exchange.id);
     return () => {
       cancelled = true;
+      controller.abort();
+      for (const timer of retryTimers.values()) window.clearTimeout(timer);
     };
   }, []);
   useEffect(() => {
     const available = markets.filter((market) => market.provider === provider);
-    if (markets.length && !available.length) {
+    if (
+      markets.length &&
+      !available.length &&
+      marketResolvedProviders.includes(provider)
+    ) {
       const workingExchange = [
         "mexc",
         "bybit",
@@ -613,7 +1458,59 @@ function App() {
         available[0];
       setSymbol(fallback.symbol);
     }
-  }, [markets, provider, symbol]);
+  }, [markets, marketResolvedProviders, provider, symbol]);
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    setTimeframeChanges({});
+    setDailyStats(null);
+    setWeeklyStats(null);
+    setDailyHistory([]);
+    Promise.allSettled(
+      intervals.map(async (timeframe) => {
+        const historyLimit = timeframe === "1d" ? 500 : 2;
+        const response = await fetch(
+          `/api/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&provider=${provider}&limit=${historyLimit}`,
+          { signal: controller.signal },
+        );
+        const body = await response.json();
+        if (!response.ok || !body.candles?.length)
+          throw new Error(body.error || `${timeframe} summary unavailable`);
+        const history = body.candles as Candle[];
+        const latest = history[history.length - 1];
+        return { timeframe, latest, history };
+      }),
+    ).then((results) => {
+      if (cancelled) return;
+      const changes: Record<string, number> = {};
+      let nextDailyStats: DailyStats | null = null;
+      let nextWeeklyStats: DailyStats | null = null;
+      let nextDailyHistory: Candle[] = [];
+      for (const result of results) {
+        if (result.status !== "fulfilled") continue;
+        changes[result.value.timeframe] = candleChangePercent(
+          result.value.latest,
+        );
+        if (result.value.timeframe === "1d") {
+          const { time, open, high, low, close } = result.value.latest;
+          nextDailyStats = { time, open, high, low, close };
+          nextDailyHistory = result.value.history;
+        }
+        if (result.value.timeframe === "1w") {
+          const { time, open, high, low, close } = result.value.latest;
+          nextWeeklyStats = { time, open, high, low, close };
+        }
+      }
+      setTimeframeChanges(changes);
+      setDailyStats(nextDailyStats);
+      setWeeklyStats(nextWeeklyStats);
+      setDailyHistory(nextDailyHistory);
+    });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [provider, symbol, reload]);
   useEffect(() => {
     if (!chartDiv.current) return;
     const chart = createChart(chartDiv.current, {
@@ -772,8 +1669,28 @@ function App() {
       dcLower,
     };
     markersRef.current = markerHandle;
+    const inspectCandle = (event: { time?: Time }) => {
+      if (typeof event.time !== "number") {
+        setSelectedCandle(null);
+        return;
+      }
+      const index = candlesRef.current.findIndex(
+        (candle) => candle.time === event.time,
+      );
+      const candle = candlesRef.current[index];
+      if (!candle) return;
+      setSelectedCandle({
+        candle,
+        index,
+        readings: recognizeCandlestick(candlesRef.current, index),
+      });
+    };
+    chart.subscribeClick(inspectCandle);
     return () => {
+      chart.unsubscribeClick(inspectCandle);
       levelPriceLinesRef.current = [];
+      signalPriceLinesRef.current = [];
+      paperPriceLinesRef.current = [];
       markersRef.current = null;
       indicatorSeries.current = null;
       volumeRef.current = null;
@@ -785,27 +1702,59 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     let ws: WebSocket | null = null;
-    let retry: number | undefined;
+    let socketRetry: number | undefined;
+    let dataRetry: number | undefined;
     let heartbeat: number | undefined;
+    let loadFailures = 0;
+    let activeLoadController: AbortController | null = null;
     setLoading(true);
     setError("");
     setLive(false);
     setCandles([]);
     candlesRef.current = [];
+    setSelectedCandle(null);
     setAiText("");
-    setSignalText("");
+    setSignalPlan(null);
     setSignalError("");
     async function load() {
+      if (cancelled) return;
+      if (dataRetry !== undefined) {
+        window.clearTimeout(dataRetry);
+        dataRetry = undefined;
+      }
+      const requestController = new AbortController();
+      activeLoadController = requestController;
+      const requestTimeout = window.setTimeout(
+        () => requestController.abort(),
+        35000,
+      );
       try {
         const response = await fetch(
           `/api/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&provider=${provider}`,
+          { signal: requestController.signal, cache: "no-store" },
         );
         const body = await response.json();
         if (!response.ok)
           throw new Error(body.error || "Market data unavailable");
         if (cancelled) return;
+        loadFailures = 0;
+        setError("");
         candlesRef.current = body.candles;
         setCandles(body.candles);
+        const latest = body.candles[body.candles.length - 1] as Candle;
+        setTimeframeChanges((current) => ({
+          ...current,
+          [interval]: candleChangePercent(latest),
+        }));
+        if (interval === "1d") {
+          const { time, open, high, low, close } = latest;
+          setDailyStats({ time, open, high, low, close });
+          setDailyHistory(body.candles);
+        }
+        if (interval === "1w") {
+          const { time, open, high, low, close } = latest;
+          setWeeklyStats({ time, open, high, low, close });
+        }
         seriesRef.current?.setData(
           body.candles.map((c: Candle) => ({
             time: c.time as Time,
@@ -830,11 +1779,22 @@ function App() {
         connect();
       } catch (e) {
         if (!cancelled) {
-          setError(
-            e instanceof Error ? e.message : "Failed to load market data",
-          );
+          const delay = Math.min(30000, 1500 * 2 ** Math.min(loadFailures, 4));
+          loadFailures += 1;
+          const message = e instanceof Error
+            ? e.message
+            : "Failed to load market data";
+          setError(`${message} · retrying in ${Math.ceil(delay / 1000)}s`);
           setLoading(false);
+          dataRetry = window.setTimeout(() => {
+            dataRetry = undefined;
+            void load();
+          }, delay);
         }
+      } finally {
+        window.clearTimeout(requestTimeout);
+        if (activeLoadController === requestController)
+          activeLoadController = null;
       }
     }
     function applyLiveCandle(c: Candle) {
@@ -849,6 +1809,34 @@ function App() {
       }
       candlesRef.current = next;
       setCandles(next);
+      setTimeframeChanges((current) => ({
+        ...current,
+        [interval]: candleChangePercent(c),
+      }));
+      if (interval === "1d") {
+        const { time, open, high, low, close } = c;
+        setDailyStats({ time, open, high, low, close });
+        setDailyHistory((history) => {
+          const existingDay = history.findIndex((day) => day.time === c.time);
+          if (existingDay < 0) return [...history, c].slice(-500);
+          const nextHistory = history.slice();
+          nextHistory[existingDay] = c;
+          return nextHistory;
+        });
+      }
+      if (interval === "1w") {
+        const { time, open, high, low, close } = c;
+        setWeeklyStats({ time, open, high, low, close });
+      }
+      setSelectedCandle((selected) =>
+        selected?.candle.time === c.time
+          ? {
+              candle: c,
+              index: selected.index,
+              readings: recognizeCandlestick(next, selected.index),
+            }
+          : selected,
+      );
       seriesRef.current?.update({
         time: c.time as Time,
         open: c.open,
@@ -1013,7 +2001,7 @@ function App() {
         window.clearInterval(heartbeat);
         if (!cancelled) {
           setLive(false);
-          retry = window.setTimeout(connect, 5000);
+          socketRetry = window.setTimeout(connect, 5000);
         }
       };
       ws.onerror = () => ws?.close();
@@ -1021,8 +2009,10 @@ function App() {
     load();
     return () => {
       cancelled = true;
-      window.clearTimeout(retry);
+      window.clearTimeout(socketRetry);
+      window.clearTimeout(dataRetry);
       window.clearInterval(heartbeat);
+      activeLoadController?.abort();
       ws?.close();
     };
   }, [symbol, interval, provider, reload]);
@@ -1118,17 +2108,127 @@ function App() {
             : [],
         ),
       );
+    if (signalPlan && signalPlan.direction !== "WAIT") {
+      const signalCandle = completed.find(
+        (candle) => candle.time === signalPlan.time,
+      );
+      if (signalCandle) {
+        const isLong = signalPlan.direction === "LONG";
+        markers.push({
+          time: signalCandle.time as Time,
+          position: isLong ? ("belowBar" as const) : ("aboveBar" as const),
+          color: isLong ? "#35d6a0" : "#ef7782",
+          shape: isLong ? ("arrowUp" as const) : ("arrowDown" as const),
+          text: `${signalPlan.direction} ENTRY`,
+        });
+      }
+    }
     markersRef.current?.setMarkers(
       markers.sort((a, b) => (a.time as number) - (b.time as number)),
     );
-  }, [analysis, showPivots, concepts.structure, candles]);
+  }, [analysis, showPivots, concepts.structure, candles, signalPlan]);
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    for (const priceLine of signalPriceLinesRef.current)
+      series.removePriceLine(priceLine);
+    signalPriceLinesRef.current = [];
+    if (!signalPlan) return;
+
+    const addLine = (
+      price: number | null,
+      title: string,
+      color: string,
+      axisLabelColor: string,
+      lineStyle: LineStyle,
+    ) => {
+      if (price === null || !Number.isFinite(price)) return;
+      signalPriceLinesRef.current.push(
+        series.createPriceLine({
+          price,
+          title,
+          color,
+          axisLabelColor,
+          axisLabelTextColor: "#ffffff",
+          lineWidth: 2,
+          lineStyle,
+          lineVisible: true,
+          axisLabelVisible: true,
+        }),
+      );
+    };
+
+    if (signalPlan.direction === "LONG") {
+      addLine(signalPlan.entry, "LONG ENTRY", "#35d6a0", "#176b55", LineStyle.Solid);
+      addLine(signalPlan.stop, "INVALIDATION", "#ef7782", "#803c43", LineStyle.Dashed);
+      addLine(signalPlan.target, "TARGET", "#e6b95d", "#7c612b", LineStyle.Dashed);
+    } else if (signalPlan.direction === "SHORT") {
+      addLine(signalPlan.entry, "SHORT ENTRY", "#ef7782", "#803c43", LineStyle.Solid);
+      addLine(signalPlan.stop, "INVALIDATION", "#d88b91", "#803c43", LineStyle.Dashed);
+      addLine(signalPlan.target, "TARGET", "#e6b95d", "#7c612b", LineStyle.Dashed);
+    } else {
+      addLine(signalPlan.buyTrigger, "WATCH LONG", "#35d6a0", "#176b55", LineStyle.Dotted);
+      addLine(signalPlan.sellTrigger, "WATCH SHORT", "#ef7782", "#803c43", LineStyle.Dotted);
+    }
+    chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
+    return () => {
+      for (const priceLine of signalPriceLinesRef.current)
+        series.removePriceLine(priceLine);
+      signalPriceLinesRef.current = [];
+    };
+  }, [signalPlan]);
+  useEffect(() => {
+    const series = seriesRef.current;
+    const position = paperPortfolio.openPosition;
+    for (const priceLine of paperPriceLinesRef.current)
+      series?.removePriceLine(priceLine);
+    paperPriceLinesRef.current = [];
+    if (
+      !series ||
+      !position ||
+      position.provider !== provider ||
+      position.symbol !== symbol ||
+      position.interval !== interval
+    ) return;
+
+    const addPaperLine = (
+      price: number,
+      title: string,
+      color: string,
+      lineStyle: LineStyle,
+    ) => {
+      paperPriceLinesRef.current.push(
+        series.createPriceLine({
+          price,
+          title,
+          color,
+          axisLabelColor: color,
+          axisLabelTextColor: "#ffffff",
+          lineWidth: 2,
+          lineStyle,
+          lineVisible: true,
+          axisLabelVisible: true,
+        }),
+      );
+    };
+    addPaperLine(position.entry, `DEMO ${position.direction}`, "#69a9ff", LineStyle.Solid);
+    addPaperLine(position.stop, "DEMO STOP", "#ef7782", LineStyle.Dashed);
+    addPaperLine(position.target, "DEMO TARGET", "#45d6a3", LineStyle.Dashed);
+    addPaperLine(position.liquidationPrice, "EST. LIQ.", "#d58cff", LineStyle.Dotted);
+    chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
+    return () => {
+      for (const priceLine of paperPriceLinesRef.current)
+        series.removePriceLine(priceLine);
+      paperPriceLinesRef.current = [];
+    };
+  }, [interval, paperPortfolio.openPosition, provider, symbol]);
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
     for (const priceLine of levelPriceLinesRef.current)
       series.removePriceLine(priceLine);
     levelPriceLinesRef.current = [];
-    if (!visibleLevels.length) {
+    if (!visibleLevels.length && !activeRangeStats) {
       series.applyOptions({ autoscaleInfoProvider: undefined });
       return;
     }
@@ -1147,6 +2247,10 @@ function App() {
         const selectedHighs = visibleLevels.map(
           (level) => level.price + zoneBand,
         );
+        if (activeRangeStats) {
+          selectedLows.push(activeRangeStats.low);
+          selectedHighs.push(activeRangeStats.high);
+        }
         const minValue = Math.min(info.priceRange.minValue, ...selectedLows);
         const maxValue = Math.max(info.priceRange.maxValue, ...selectedHighs);
         const padding = Math.max(
@@ -1162,7 +2266,7 @@ function App() {
         };
       },
     });
-    levelPriceLinesRef.current = visibleLevels.map((level) => {
+    const nextPriceLines = visibleLevels.map((level) => {
       const shortKind = level.kind === "support" ? "S" : "R";
       return series.createPriceLine({
         price: level.price,
@@ -1176,6 +2280,33 @@ function App() {
         title: `${shortKind}${level.rank} · ${level.touches} touches`,
       });
     });
+    if (activeRangeStats && activeRangeLabel) {
+      nextPriceLines.push(
+        series.createPriceLine({
+          price: activeRangeStats.high,
+          color: "#e6b95d",
+          lineWidth: 1,
+          lineStyle: LineStyle.Dotted,
+          lineVisible: true,
+          axisLabelVisible: true,
+          axisLabelColor: "#7c612b",
+          axisLabelTextColor: "#ffffff",
+          title: `${activeRangeLabel} ATH`,
+        }),
+        series.createPriceLine({
+          price: activeRangeStats.low,
+          color: "#779bf2",
+          lineWidth: 1,
+          lineStyle: LineStyle.Dotted,
+          lineVisible: true,
+          axisLabelVisible: true,
+          axisLabelColor: "#3b5184",
+          axisLabelTextColor: "#ffffff",
+          title: `${activeRangeLabel} ATL`,
+        }),
+      );
+    }
+    levelPriceLinesRef.current = nextPriceLines;
     chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
     return () => {
       for (const priceLine of levelPriceLinesRef.current)
@@ -1183,7 +2314,7 @@ function App() {
       levelPriceLinesRef.current = [];
       series.applyOptions({ autoscaleInfoProvider: undefined });
     };
-  }, [analysis, visibleLevels]);
+  }, [activeRangeLabel, activeRangeStats, analysis, visibleLevels]);
   useEffect(() => {
     const chart = chartRef.current,
       series = seriesRef.current,
@@ -1310,13 +2441,13 @@ function App() {
           );
       }
       setConceptRects(rectangles);
-      if (concepts.fibonacci && analysis.fibonacci) {
-        const start = xAt(analysis.fibonacci.startIndex),
-          end = xAt(analysis.fibonacci.endIndex);
+      if (concepts.fibonacci && fibonacciForDisplay) {
+        const start = xAt(fibonacciForDisplay.startIndex),
+          end = xAt(fibonacciForDisplay.endIndex);
         if (start !== null && end !== null) {
           const left = Math.max(0, Math.min(start, end));
           setFibLines(
-            analysis.fibonacci.levels.flatMap((level) => {
+            fibonacciForDisplay.levels.flatMap((level) => {
               const top = series.priceToCoordinate(level.price);
               return top === null
                 ? []
@@ -1327,7 +2458,7 @@ function App() {
                       top,
                       ratio: level.ratio,
                       price: level.price,
-                      name: fibName(level.ratio, analysis.fibonacci!.direction),
+                      name: fibName(level.ratio, fibonacciForDisplay.direction),
                     },
                   ];
             }),
@@ -1345,12 +2476,214 @@ function App() {
     };
   }, [
     analysis,
+    fibonacciForDisplay,
     candles,
     concepts.fibonacci,
     concepts.fairValueGaps,
     concepts.orderBlocks,
   ]);
+  useEffect(() => {
+    const chart = chartRef.current,
+      series = seriesRef.current,
+      container = chartDiv.current;
+    if (!chart || !series || !container || !focusedPattern) {
+      setPatternDrawing(null);
+      return;
+    }
+    const completed = candles.filter((candle) => candle.closed);
+    const update = () => {
+      const timeScale = chart.timeScale();
+      const coordinateAt = (index: number, price: number) => {
+        const candle = completed[index];
+        if (!candle) return null;
+        const x = timeScale.timeToCoordinate(candle.time as Time);
+        const y = series.priceToCoordinate(price);
+        return x === null || y === null || !Number.isFinite(x) || !Number.isFinite(y)
+          ? null
+          : { x, y };
+      };
+      const segments = focusedPattern.segments.flatMap((segment) => {
+        const from = coordinateAt(segment.from.index, segment.from.price);
+        const to = coordinateAt(segment.to.index, segment.to.price);
+        return from && to
+          ? [{ x1: from.x, y1: from.y, x2: to.x, y2: to.y }]
+          : [];
+      });
+      const points = focusedPattern.points.flatMap((point) => {
+        const coordinate = coordinateAt(point.index, point.price);
+        return coordinate ? [{ ...coordinate, label: point.label }] : [];
+      });
+      setPatternDrawing({ segments, points });
+    };
+    update();
+    chart.timeScale().subscribeVisibleLogicalRangeChange(update);
+    const observer = new ResizeObserver(update);
+    observer.observe(container);
+    window.addEventListener("pointermove", update);
+    return () => {
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(update);
+      observer.disconnect();
+      window.removeEventListener("pointermove", update);
+    };
+  }, [candles, focusedPattern]);
   const current = candles.length ? candles[candles.length - 1] : null;
+  const paperEntryValue = paperEntry.trim()
+    ? Number(paperEntry)
+    : current?.close ?? 0;
+  const paperStopDistance = Math.max(
+    (analysis?.atr ?? paperEntryValue * 0.01) * 1.5,
+    paperEntryValue * 0.001,
+  );
+  const defaultPaperStop = paperDirection === "LONG"
+    ? paperEntryValue - paperStopDistance
+    : paperEntryValue + paperStopDistance;
+  const defaultPaperTarget = paperDirection === "LONG"
+    ? paperEntryValue + paperStopDistance * 2
+    : paperEntryValue - paperStopDistance * 2;
+  const paperStopValue = paperStop.trim() ? Number(paperStop) : defaultPaperStop;
+  const paperTargetValue = paperTarget.trim()
+    ? Number(paperTarget)
+    : defaultPaperTarget;
+  const paperQuoteResult = current
+    ? calculatePaperQuote({
+        direction: paperDirection,
+        entry: paperEntryValue,
+        stop: paperStopValue,
+        target: paperTargetValue,
+        riskPercent: Number(paperRiskPercent),
+        leverage: Number(paperLeverage),
+        maintenanceMarginPercent: Number(paperMaintenanceMarginPercent),
+        feePercent: Number(paperFeePercent),
+        balance: paperPortfolio.balance,
+      })
+    : { quote: null, error: "Waiting for price data." };
+  const activePaperPosition = paperPortfolio.openPosition;
+  const paperPositionMatchesChart = Boolean(
+    activePaperPosition &&
+    activePaperPosition.provider === provider &&
+    activePaperPosition.symbol === symbol &&
+    activePaperPosition.interval === interval,
+  );
+  const paperMarkPrice = paperPositionMatchesChart && current
+    ? current.close
+    : activePaperPosition?.markPrice ?? 0;
+  const paperUnrealizedPnl = paperPositionMatchesChart && activePaperPosition && current
+    ? paperPositionPnl(activePaperPosition, current.close)
+    : null;
+  const paperEquity = paperPortfolio.balance + (paperUnrealizedPnl ?? 0);
+  const paperAvailable = paperPortfolio.balance - (activePaperPosition?.margin ?? 0);
+  const activeTimeframeChange = current
+    ? candleChangePercent(current)
+    : timeframeChanges[interval];
+  const selectedCandleMetrics = selectedCandle
+    ? {
+        body: Math.abs(
+          selectedCandle.candle.close - selectedCandle.candle.open,
+        ),
+        upperWick:
+          selectedCandle.candle.high -
+          Math.max(selectedCandle.candle.open, selectedCandle.candle.close),
+        lowerWick:
+          Math.min(selectedCandle.candle.open, selectedCandle.candle.close) -
+          selectedCandle.candle.low,
+        change: candleChangePercent(selectedCandle.candle),
+      }
+    : null;
+  useEffect(() => {
+    const position = paperPortfolio.openPosition;
+    if (
+      !position ||
+      position.provider !== provider ||
+      position.symbol !== symbol ||
+      position.interval !== interval
+    ) return;
+
+    const laterCandles = candles.filter(
+      (candle) => candle.closed && candle.time > position.openedAtTime,
+    );
+    for (const candle of laterCandles) {
+      const stopHit = position.direction === "LONG"
+        ? candle.low <= position.stop
+        : candle.high >= position.stop;
+      const targetHit = position.direction === "LONG"
+        ? candle.high >= position.target
+        : candle.low <= position.target;
+      const liquidationGap = position.direction === "LONG"
+        ? candle.open <= position.liquidationPrice
+        : candle.open >= position.liquidationPrice;
+      // When one candle crosses both levels, use the stop first as a conservative fill assumption.
+      if (liquidationGap || stopHit || targetHit) {
+        const reason = liquidationGap
+          ? "Estimated liquidation"
+          : stopHit
+            ? "Stop hit"
+            : "Target hit";
+        const triggerPrice = stopHit ? position.stop : position.target;
+        const gapPrice = liquidationGap
+          ? candle.open
+          : stopHit
+          ? position.direction === "LONG"
+            ? Math.min(candle.open, triggerPrice)
+            : Math.max(candle.open, triggerPrice)
+          : triggerPrice;
+        const portfolio = paperPortfolioRef.current;
+        if (portfolio.openPosition?.id === position.id) {
+          const closedPortfolio = recordPaperClose(
+            portfolio,
+            position,
+            gapPrice,
+            candle.time,
+            reason,
+          );
+          replacePaperPortfolio(closedPortfolio);
+          if (!position.copiedFrom)
+            void publishCopyEvent("close", {
+              positionId: position.id,
+              exitPrice: gapPrice,
+              closedAtTime: candle.time,
+              reason,
+              pnl: closedPortfolio.history[0]?.pnl || 0,
+            });
+        }
+        return;
+      }
+    }
+    const latestMark = candles[candles.length - 1]?.close;
+    if (latestMark && Number.isFinite(latestMark) && latestMark !== position.markPrice) {
+      const portfolio = paperPortfolioRef.current;
+      if (portfolio.openPosition?.id === position.id)
+        replacePaperPortfolio({
+          ...portfolio,
+          openPosition: { ...position, markPrice: latestMark },
+        });
+    }
+  }, [candles, interval, paperPortfolio.openPosition, provider, symbol]);
+  function focusChartPattern(pattern: ChartPattern) {
+    const completed = candles.filter((candle) => candle.closed);
+    const first = completed[pattern.startIndex];
+    const last = completed[pattern.endIndex];
+    const timeScale = chartRef.current?.timeScale();
+    if (!first || !last || !timeScale) return;
+    const firstChartIndex = candles.findIndex(
+      (candle) => candle.time === first.time,
+    );
+    const lastChartIndex = candles.findIndex(
+      (candle) => candle.time === last.time,
+    );
+    if (firstChartIndex < 0 || lastChartIndex < 0) return;
+    const span = Math.max(1, lastChartIndex - firstChartIndex);
+    const padding = Math.max(10, Math.ceil(span * 0.16));
+    const secondsPerBar =
+      completed.length > 1
+        ? Math.max(1, completed[1].time - completed[0].time)
+        : 60 * 60 * 4;
+    setSelectedCandle(null);
+    setFocusedPatternName(pattern.name);
+    timeScale.setVisibleRange({
+      from: (first.time - padding * secondsPerBar) as Time,
+      to: (last.time + padding * secondsPerBar) as Time,
+    });
+  }
   function toggleIndicator(key: IndicatorKey) {
     setIndicators((current) => ({ ...current, [key]: !current[key] }));
   }
@@ -1552,8 +2885,8 @@ function App() {
       description: conceptInfo.fibonacci.description,
       facts: [
         `Level price: ${formatPrice(line.price)}`,
-        analysis?.fibonacci
-          ? `${analysis.fibonacci.direction === "bullish" ? "Bullish" : "Bearish"} swing measurement`
+        fibonacciForDisplay
+          ? `${fibonacciForDisplay.direction === "bullish" ? "Long" : "Short"} swing measurement`
           : "Swing measurement",
       ],
     });
@@ -1589,39 +2922,238 @@ function App() {
     }
   }
   function chooseMarket(market: Market) {
-    if (market.provider) setProvider(market.provider);
+    if (market.provider) {
+      setProvider(market.provider);
+      setMarketScope(market.provider);
+    }
     setSymbol(market.symbol);
     setMarketQuery("");
     setMarketMenu(false);
   }
-  async function generateSignal() {
+  function generateSignal() {
     if (!analysis || !riskAcknowledged) return;
-    setSignalLoading(true);
-    setSignalText("");
-    setSignalError("");
-    setSignalModal(false);
     try {
-      const response = await fetch("/api/signal", {
+      setSignalPlan(buildRuleSignal(candles, analysis, signalFactors));
+      setSignalError("");
+    } catch (e) {
+      setSignalError(
+        e instanceof Error ? e.message : "Could not evaluate the current chart",
+      );
+    }
+    setSignalModal(false);
+  }
+  function toggleSignalFactor(factor: SignalFactor) {
+    const isSelected = signalFactors.includes(factor);
+    if (isSelected && signalFactors.length <= 2) return;
+    setSignalFactors((current) =>
+      current.includes(factor)
+        ? current.filter((selected) => selected !== factor)
+        : SIGNAL_FACTORS.filter(
+            (item) => item.id === factor || current.includes(item.id),
+          ).map((item) => item.id),
+    );
+    setSignalPlan(null);
+    setSignalError("");
+  }
+  function loadSignalIntoPaperSetup() {
+    if (
+      !signalPlan ||
+      signalPlan.direction === "WAIT" ||
+      signalPlan.entry === null ||
+      signalPlan.stop === null ||
+      signalPlan.target === null
+    ) return;
+    setPaperDirection(signalPlan.direction);
+    setPaperEntry(String(signalPlan.entry));
+    setPaperStop(String(signalPlan.stop));
+    setPaperTarget(String(signalPlan.target));
+    setPaperError("");
+  }
+  function openPaperPosition(directionOverride: PaperDirection = paperDirection) {
+    if (!current) {
+      setPaperError("Wait for chart price data before opening a demo position.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    if (paperPortfolioRef.current.openPosition) {
+      setPaperError("Close the open demo position before opening another.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    const latestCompleted = [...candles].reverse().find((candle) => candle.closed);
+    if (!latestCompleted) {
+      setPaperError("A completed candle is needed to start the simulation.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    const entryValue = paperEntry.trim() ? Number(paperEntry) : current.close;
+    const stopDistance = Math.max(
+      (analysis?.atr ?? entryValue * 0.01) * 1.5,
+      entryValue * 0.001,
+    );
+    const isCurrentDirection = directionOverride === paperDirection;
+    const stopValue = isCurrentDirection && paperStop.trim()
+      ? Number(paperStop)
+      : directionOverride === "LONG"
+        ? entryValue - stopDistance
+        : entryValue + stopDistance;
+    const targetValue = isCurrentDirection && paperTarget.trim()
+      ? Number(paperTarget)
+      : directionOverride === "LONG"
+        ? entryValue + stopDistance * 2
+        : entryValue - stopDistance * 2;
+    const quoteResult = calculatePaperQuote({
+      direction: directionOverride,
+      entry: entryValue,
+      stop: stopValue,
+      target: targetValue,
+      riskPercent: Number(paperRiskPercent),
+      leverage: Number(paperLeverage),
+      maintenanceMarginPercent: Number(paperMaintenanceMarginPercent),
+      feePercent: Number(paperFeePercent),
+      balance: paperPortfolio.balance,
+    });
+    if (!quoteResult.quote) {
+      setPaperDirection(directionOverride);
+      if (!isCurrentDirection) {
+        setPaperStop("");
+        setPaperTarget("");
+      }
+      setPaperError(quoteResult.error);
+      setPaperDockExpanded(true);
+      return;
+    }
+    if (!isCurrentDirection) {
+      setPaperDirection(directionOverride);
+      setPaperStop("");
+      setPaperTarget("");
+    }
+    const quote = quoteResult.quote;
+    const position: PaperPosition = {
+      id: `${provider}-${symbol}-${Date.now()}`,
+      direction: directionOverride,
+      provider,
+      symbol,
+      interval,
+      openedAtTime: latestCompleted.time,
+      entry: entryValue,
+      stop: stopValue,
+      target: targetValue,
+      quantity: quote.quantity,
+      leverage: Number(paperLeverage),
+      margin: quote.margin,
+      liquidationPrice: quote.liquidationPrice,
+      riskAmount: quote.stopLoss,
+      feeRate: quote.feeRate,
+      markPrice: current.close,
+    };
+    const accountBalance = paperPortfolioRef.current.balance;
+    replacePaperPortfolio({
+      ...paperPortfolioRef.current,
+      openPosition: position,
+    });
+    void publishCopyEvent("open", { position, accountBalance });
+    setPaperError("");
+  }
+  function closePaperPositionAtMark() {
+    const position = paperPortfolioRef.current.openPosition;
+    if (!position || !current || !paperPositionMatchesChart) return;
+    const portfolio = paperPortfolioRef.current;
+    if (portfolio.openPosition?.id !== position.id) return;
+    const closedPortfolio = recordPaperClose(
+      portfolio,
+      position,
+      current.close,
+      current.time,
+      "Closed manually",
+    );
+    replacePaperPortfolio(closedPortfolio);
+    if (!position.copiedFrom)
+      void publishCopyEvent("close", {
+        positionId: position.id,
+        exitPrice: current.close,
+        closedAtTime: current.time,
+        reason: "Closed manually",
+        pnl: closedPortfolio.history[0]?.pnl || 0,
+      });
+  }
+  async function saveCopyProfile() {
+    setCopySaving(true);
+    setCopyError("");
+    try {
+      const currentPosition = paperPortfolioRef.current.openPosition;
+      const currentTrade =
+        currentPosition && !currentPosition.copiedFrom
+          ? { position: currentPosition, accountBalance: paperPortfolioRef.current.balance }
+          : undefined;
+      const response = await fetch("/api/copy-trading/profile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
         body: JSON.stringify({
-          symbol,
-          interval,
-          provider,
-          analysis,
-          riskAcknowledged: true,
+          displayName: copyNameDraft,
+          isPublic: copyShareDraft,
+          ...(copyShareDraft && currentTrade ? { currentTrade } : {}),
         }),
       });
       const body = await response.json();
-      if (!response.ok) throw new Error(body.error || "Signal unavailable");
-      setSignalText(body.text);
-    } catch (e) {
-      setSignalError(
-        e instanceof Error ? e.message : "AI signal request failed",
-      );
+      if (!response.ok) throw new Error(body.error || "Could not save your trader profile.");
+      const nextSnapshot = copySnapshotRef.current
+        ? { ...copySnapshotRef.current, me: body.profile }
+        : null;
+      if (nextSnapshot) {
+        copySnapshotRef.current = nextSnapshot;
+        setCopySnapshot(nextSnapshot);
+      }
+      setCopyNameDraft(body.profile.displayName);
+      setCopyShareDraft(body.profile.isPublic);
+      setCopyStatus(body.profile.isPublic ? "Your demo trades are shared live." : "Your demo trades are private.");
+      window.setTimeout(() => void syncCopyTrading(), 0);
+    } catch (error) {
+      setCopyError(error instanceof Error ? error.message : "Could not save your trader profile.");
     } finally {
-      setSignalLoading(false);
-      setRiskAcknowledged(false);
+      setCopySaving(false);
+    }
+  }
+  async function updateCopyFollow(
+    trader: CopyProfile,
+    enabled: boolean,
+    copyScale: number,
+  ) {
+    setCopyError("");
+    setCopySaving(true);
+    try {
+      const response = await fetch("/api/copy-trading/follow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ traderId: trader.id, enabled, copyScale }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || "Could not update copy settings.");
+      setCopyScaleDrafts((current) => ({ ...current, [trader.id]: copyScale }));
+      const current = copySnapshotRef.current;
+      if (current) {
+        const follow: CopyFollow = { traderId: trader.id, enabled, copyScale };
+        const nextSnapshot = {
+          ...current,
+          follows: [
+            follow,
+            ...current.follows.filter((item) => item.traderId !== trader.id),
+          ],
+        };
+        copySnapshotRef.current = nextSnapshot;
+        setCopySnapshot(nextSnapshot);
+      }
+      if (enabled)
+        setCopyStatus(`Following ${trader.displayName} · waiting for their next demo trade.`);
+      else
+        setCopyStatus(`Paused new entries from ${trader.displayName}; any open copied position will still follow their exit.`);
+      window.setTimeout(() => void syncCopyTrading(), 0);
+    } catch (error) {
+      setCopyError(error instanceof Error ? error.message : "Could not update copy settings.");
+    } finally {
+      setCopySaving(false);
     }
   }
   async function sendChat(prompt = chatInput) {
@@ -1690,18 +3222,22 @@ function App() {
         <select
           className="exchange"
           aria-label="Exchange"
-          value={provider}
+          value={marketScope}
           onChange={(e) => {
-            const next = e.target.value,
-              set = markets.filter((market) => market.provider === next),
-              fallback =
-                set.find((market) => market.symbol === "BTCUSDT") ||
-                set.find((market) => market.symbol === "BTCUSDC") ||
-                set[0];
+            const next = e.target.value;
+            setMarketScope(next);
+            if (next === "all") return;
+            const set = markets.filter((market) => market.provider === next);
+            const fallback =
+              set.find((market) => market.symbol === symbol) ||
+              set.find((market) => market.symbol === "BTCUSDT") ||
+              set.find((market) => market.symbol === "BTCUSDC") ||
+              set[0];
             setProvider(next);
             if (fallback) setSymbol(fallback.symbol);
           }}
         >
+          <option value="all">All exchanges</option>
           {exchanges.map((x) => (
             <option value={x.id} key={x.id}>
               {x.name}
@@ -1714,16 +3250,19 @@ function App() {
           <span className="market-count">
             {marketsLoading
               ? "Loading all markets…"
-              : `${markets.length.toLocaleString()} markets · ${new Set(markets.map((market) => market.provider)).size} exchanges`}
+              : `${marketsInScope.length.toLocaleString()} coin pairs · ${marketScope === "all" ? `across ${loadedMarketProviderCount}/6 exchanges` : exchanges.find((exchange) => exchange.id === marketScope)?.name || "selected exchange"}${marketFailuresInScope.length ? ` · retrying ${marketFailuresInScope.length} feed${marketFailuresInScope.length === 1 ? "" : "s"}` : ""}`}
           </span>
           <Search size={14} />
           <input
             role="combobox"
-            aria-label="Search all exchange markets"
+            aria-label={
+              marketScope === "all"
+                ? "Search all exchange markets"
+                : `Search ${exchanges.find((exchange) => exchange.id === marketScope)?.name || "exchange"} markets`
+            }
             aria-expanded={marketMenu}
             aria-controls="market-results"
             autoComplete="off"
-            disabled={marketsLoading}
             value={
               marketMenu
                 ? marketQuery
@@ -1735,6 +3274,12 @@ function App() {
             onFocus={() => {
               setMarketQuery("");
               setMarketMenu(true);
+            }}
+            onClick={() => {
+              if (!marketMenu) {
+                setMarketQuery("");
+                setMarketMenu(true);
+              }
             }}
             onChange={(e) => {
               setMarketQuery(e.target.value);
@@ -1779,22 +3324,43 @@ function App() {
                 })
               ) : (
                 <div className="no-markets">
-                  No matching market across connected exchanges
+                  {marketsLoading
+                    ? "Loading exchange listings…"
+                    : marketFailuresInScope.length
+                      ? "Exchange feeds are temporarily unavailable. Any cached pairs remain searchable; feeds retry automatically."
+                      : "No matching market across connected exchanges"}
+                </div>
+              )}
+              {filteredMarkets.length > marketMatches.length && (
+                <div className="market-results-note">
+                  Showing {marketMatches.length} of{" "}
+                  {filteredMarkets.length.toLocaleString()} matches · type to
+                  narrow the list
                 </div>
               )}
             </div>
           )}
         </div>
         <div className="times">
-          {intervals.map((t) => (
-            <button
-              key={t}
-              className={interval === t ? "active" : ""}
-              onClick={() => setIntervalValue(t)}
-            >
-              {t}
-            </button>
-          ))}
+          {intervals.map((t) => {
+            const change =
+              t === interval ? activeTimeframeChange : timeframeChanges[t];
+            return (
+              <button
+                key={t}
+                className={interval === t ? "active" : ""}
+                aria-label={`${t} timeframe${change === undefined ? "" : `, ${formatPercent(change)} change`}`}
+                onClick={() => setIntervalValue(t)}
+              >
+                <span>{t}</span>
+                {change !== undefined && (
+                  <small className={change >= 0 ? "up" : "down"}>
+                    {formatPercent(change)}
+                  </small>
+                )}
+              </button>
+            );
+          })}
         </div>
         <div className="status">
           <span className={live ? "dot live" : "dot"} />
@@ -1818,6 +3384,13 @@ function App() {
                       })
                     : "—"}
                 </span>
+                {activeTimeframeChange !== undefined && (
+                  <span
+                    className={`price-change ${activeTimeframeChange >= 0 ? "up" : "down"}`}
+                  >
+                    {formatPercent(activeTimeframeChange)}
+                  </span>
+                )}
               </h1>
               {current && (
                 <div className="ohlc">
@@ -1846,6 +3419,27 @@ function App() {
                         maximumFractionDigits: 2,
                       })}
                     </b>
+                  </span>
+                </div>
+              )}
+              {activeRangeStats && activeRangeLabel && (
+                <div
+                  className="daily-range"
+                  aria-label={`${activeRangeLabel.toLowerCase()} price range`}
+                >
+                  <span
+                    className="daily-high"
+                    title={`${activeRangeLabel.toLowerCase()} high from available coin history`}
+                  >
+                    {activeRangeLabel} ATH{" "}
+                    <b>{formatPrice(activeRangeStats.high)}</b>
+                  </span>
+                  <span
+                    className="daily-low"
+                    title={`${activeRangeLabel.toLowerCase()} low from available coin history`}
+                  >
+                    {activeRangeLabel} ATL{" "}
+                    <b>{formatPrice(activeRangeStats.low)}</b>
                   </span>
                 </div>
               )}
@@ -1934,13 +3528,40 @@ function App() {
                         </button>
                       </div>
                     ))}
+                    <div className="fib-direction-control">
+                      <span>Fibonacci swing direction</span>
+                      <div role="group" aria-label="Fibonacci swing direction">
+                        {([
+                          ["auto", "Auto"],
+                          ["long", "Long"],
+                          ["short", "Short"],
+                        ] as const).map(([mode, label]) => (
+                          <button
+                            type="button"
+                            key={mode}
+                            className={fibDirectionMode === mode ? "active" : ""}
+                            aria-pressed={fibDirectionMode === mode}
+                            onClick={() => setFibDirectionMode(mode)}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <small>
+                        Short retracements anchor from the swing high down to the low.
+                      </small>
+                    </div>
                   </div>
                 )}
               </div>
               <div className="zone-menu">
                 <button
                   className={
-                    showSupportZones || showResistanceZones ? "selected" : ""
+                    showSupportZones ||
+                    showResistanceZones ||
+                    rangeLevelPeriod !== "off"
+                      ? "selected"
+                      : ""
                   }
                   onClick={() => {
                     setZoneMenu((v) => !v);
@@ -1949,10 +3570,40 @@ function App() {
                   }}
                 >
                   <Settings2 size={15} /> Zones{" "}
-                  <span className="tool-count">{visibleLevels.length}</span>
+                  <span className="tool-count">
+                    {visibleLevels.length +
+                      (activeRangeStats ? 2 : 0)}
+                  </span>
                 </button>
                 {zoneMenu && (
                   <div className="zone-popover">
+                    <div className="level-setting range-period-setting">
+                      <span>
+                        <i className="swatch daily-range-swatch" /> ATH / ATL
+                        period
+                      </span>
+                      <select
+                        aria-label="ATH and ATL display period"
+                        value={rangeLevelPeriod}
+                        onChange={(event) =>
+                          setRangeLevelPeriod(event.target.value as RangePeriod)
+                        }
+                      >
+                        <option value="off">Off</option>
+                        {(Object.keys(rangePeriodLabels) as Exclude<
+                          RangePeriod,
+                          "off"
+                        >[]).map((period) => (
+                          <option
+                            value={period}
+                            disabled={!rangeStats[period]}
+                            key={period}
+                          >
+                            {rangePeriodLabels[period]}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                     <label>
                       <input
                         type="checkbox"
@@ -2115,6 +3766,78 @@ function App() {
           </div>
           <div className="chart-stage">
             <div className="chart-area" ref={chartDiv} />
+            {selectedCandle && selectedCandleMetrics && (
+              <section className="candle-inspector" aria-live="polite">
+                <div className="candle-inspector-head">
+                  <div>
+                    <span>CLICKED CANDLE</span>
+                    <strong>
+                      {selectedCandle.readings[0]?.name || "Price candle"}
+                    </strong>
+                  </div>
+                  <button
+                    aria-label="Close candle inspector"
+                    onClick={() => setSelectedCandle(null)}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+                <time>
+                  {new Date(
+                    selectedCandle.candle.time * 1000,
+                  ).toLocaleString()}
+                </time>
+                <div className={`candle-visual-card ${selectedCandle.candle.close >= selectedCandle.candle.open ? "bullish" : "bearish"}`}>
+                  <CandleIllustration candle={selectedCandle.candle} />
+                  <div>
+                    <span>SELECTED CANDLE SHAPE</span>
+                    <strong>
+                      {selectedCandle.candle.close >= selectedCandle.candle.open
+                        ? "Up-close candle"
+                        : "Down-close candle"}
+                    </strong>
+                    <p>Body and wick proportions are drawn from this candle’s prices.</p>
+                  </div>
+                </div>
+                <div className="candle-reading-list">
+                  {selectedCandle.readings.map((reading) => (
+                    <div className={reading.direction} key={reading.name}>
+                      <b>{reading.name}</b>
+                      <p>{reading.description}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="candle-measurements">
+                  <span>
+                    O <b>{formatPrice(selectedCandle.candle.open)}</b>
+                  </span>
+                  <span>
+                    H <b>{formatPrice(selectedCandle.candle.high)}</b>
+                  </span>
+                  <span>
+                    L <b>{formatPrice(selectedCandle.candle.low)}</b>
+                  </span>
+                  <span>
+                    C <b>{formatPrice(selectedCandle.candle.close)}</b>
+                  </span>
+                  <span>
+                    BODY <b>{formatPrice(selectedCandleMetrics.body)}</b>
+                  </span>
+                  <span>
+                    UPPER WICK{" "}
+                    <b>{formatPrice(selectedCandleMetrics.upperWick)}</b>
+                  </span>
+                  <span>
+                    LOWER WICK{" "}
+                    <b>{formatPrice(selectedCandleMetrics.lowerWick)}</b>
+                  </span>
+                  <span>
+                    CHANGE{" "}
+                    <b>{formatPercent(selectedCandleMetrics.change)}</b>
+                  </span>
+                </div>
+              </section>
+            )}
             <div className="active-indicator-legend">
               {(Object.keys(indicators) as IndicatorKey[])
                 .filter((key) => indicators[key])
@@ -2190,12 +3913,50 @@ function App() {
                 </div>
               ))}
             </div>
+            {focusedPattern && patternDrawing && (
+              <>
+                <svg
+                  className={`pattern-drawing-layer ${focusedPattern.direction}`}
+                  aria-label={`${focusedPattern.name} marked on chart`}
+                  role="img"
+                >
+                  {patternDrawing.segments.map((segment, index) => (
+                    <line
+                      key={`pattern-segment-${index}`}
+                      x1={segment.x1}
+                      y1={segment.y1}
+                      x2={segment.x2}
+                      y2={segment.y2}
+                    />
+                  ))}
+                  {patternDrawing.points.map((point, index) => (
+                    <g key={`pattern-point-${index}`}>
+                      <circle cx={point.x} cy={point.y} r="4" />
+                      <text x={point.x + 7} y={point.y - 7}>
+                        {point.label}
+                      </text>
+                    </g>
+                  ))}
+                </svg>
+                <div className={`pattern-focus-label ${focusedPattern.direction}`} role="status">
+                  <span>{focusedPattern.name} · MARKED ON CHART</span>
+                  <button
+                    aria-label={`Clear ${focusedPattern.name} chart highlight`}
+                    title="Clear pattern highlight"
+                    onClick={() => setFocusedPatternName(null)}
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              </>
+            )}
           </div>
           {loading && <div className="floating">Loading live candles…</div>}
           {error && <div className="error">{error}</div>}
           <div className="footnote">
-            Drag to pan · Scroll or pinch to zoom · SMC zones and Fibonacci
-            recalculate from completed candles · Indicators update live
+            Click any candle to identify it · Drag to pan · Scroll or pinch to
+            zoom · SMC, patterns and Fibonacci recalculate from completed
+            candles
           </div>
         </section>
         <aside>
@@ -2206,7 +3967,12 @@ function App() {
                 <BrainCircuit size={18} color="#32d59c" /> AI Analyst
               </h2>
             </div>
-            <span className="pill">BETA</span>
+            <div className="panel-head-actions">
+              <AnimatedCompanion
+                onActivate={() => chatInputRef.current?.focus()}
+              />
+              <span className="pill">BETA</span>
+            </div>
           </div>
           <div className="side-content">
             <section className="ai-chat" aria-labelledby="ai-chat-title">
@@ -2322,6 +4088,7 @@ function App() {
               {chatError && <div className="chat-error">{chatError}</div>}
               <form className="chat-composer" onSubmit={submitChat}>
                 <textarea
+                  ref={chatInputRef}
                   aria-label="Message AI"
                   placeholder="Ask about the chart, crypto, or anything else…"
                   rows={2}
@@ -2361,6 +4128,36 @@ function App() {
               {analysis?.recentStructure ||
                 "Load market data to view structural analysis."}
             </p>
+            <div className="pattern-heading">
+              <div className="eyebrow">TECHNICAL CHART PATTERNS</div>
+              <span>{analysis?.patterns.length || 0} detected</span>
+            </div>
+            {analysis?.patterns.length ? (
+              <div className="pattern-list">
+                {analysis.patterns.map((pattern) => (
+                  <button
+                    className={`pattern-card ${pattern.direction}${focusedPatternName === pattern.name ? " focused" : ""}`}
+                    key={`${pattern.name}-${pattern.startIndex}`}
+                    aria-pressed={focusedPatternName === pattern.name}
+                    title={`${pattern.description} Click to locate and mark this pattern on the chart.`}
+                    onClick={() => focusChartPattern(pattern)}
+                  >
+                    <PatternThumbnail
+                      name={pattern.name}
+                      direction={pattern.direction}
+                    />
+                    <span>{pattern.name}</span>
+                    <small>{pattern.direction}</small>
+                    <strong>{pattern.confidence}%</strong>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="muted compact">
+                No confirmed double top/bottom, head and shoulders, triangle,
+                wedge, or flag pattern in the current completed-candle window.
+              </p>
+            )}
             <div className="separator" />
             <div className="eyebrow">INDICATOR SNAPSHOT</div>
             <div className="indicator-grid">
@@ -2449,9 +4246,9 @@ function App() {
               >
                 <span>FIB 61.8% · GOLDEN RATIO</span>
                 <strong>
-                  {analysis?.fibonacci?.levels
+                  {fibonacciForDisplay?.levels
                     .find((level) => level.ratio === 0.618)
-                    ?.price.toFixed(analysis.last >= 10 ? 2 : 5) ?? "—"}
+                    ?.price.toFixed((analysis?.last ?? 0) >= 10 ? 2 : 5) ?? "—"}
                 </strong>
               </button>
             </div>
@@ -2486,11 +4283,11 @@ function App() {
             <div className="separator" />
             <div className="eyebrow">SCENARIO TRIGGERS</div>
             <div className="scenario">
-              <span>Potential bullish break</span>
+              <span>Potential long trigger</span>
               <strong>{analysis?.bullishTrigger?.toFixed(5) ?? "N/A"}</strong>
             </div>
             <div className="scenario">
-              <span>Potential bearish break</span>
+              <span>Potential short trigger</span>
               <strong>{analysis?.bearishTrigger?.toFixed(5) ?? "N/A"}</strong>
             </div>
             <div className="separator" />
@@ -2498,37 +4295,523 @@ function App() {
               <button
                 className="analyze"
                 disabled={!analysis || aiLoading}
+                aria-busy={aiLoading}
                 onClick={askAi}
               >
-                <BrainCircuit size={16} />
-                {aiLoading ? "Analysing…" : "Explain chart"}
+                <span className="action-icon">
+                  <CandlestickChart size={17} aria-hidden="true" />
+                </span>
+                <span className="action-copy">
+                  <strong>{aiLoading ? "Analysing…" : "Explain chart"}</strong>
+                  <small>AI summary of the current chart</small>
+                </span>
+                <ChevronRight className="action-arrow" size={15} aria-hidden="true" />
               </button>
               <button
                 className="generate-signal"
-                disabled={!analysis || signalLoading}
-                onClick={() => setSignalModal(true)}
+                disabled={!analysis}
+                onClick={() => {
+                  setSignalError("");
+                  if (riskAcknowledged) generateSignal();
+                  else setSignalModal(true);
+                }}
               >
-                <Sparkles size={16} />
-                {signalLoading ? "Generating…" : "Generate signal"}
+                <span className="action-icon">
+                  <Activity size={17} aria-hidden="true" />
+                </span>
+                <span className="action-copy">
+                  <strong>
+                    {riskAcknowledged && signalPlan ? "Refresh signal" : "Generate signal"}
+                  </strong>
+                  <small>Instant local analysis · no AI required</small>
+                </span>
+                <ChevronRight className="action-arrow" size={15} aria-hidden="true" />
               </button>
             </div>
-            {aiText && <div className="insights">{aiText}</div>}
-            {signalError && <div className="signal-error">{signalError}</div>}
-            {signalText && (
-              <div className="signal-output">
-                <div>
-                  <ShieldAlert size={15} /> EDUCATIONAL SIGNAL · NFA
+            <section className="signal-settings">
+              <button
+                className="signal-settings-toggle"
+                type="button"
+                aria-expanded={signalSettingsOpen}
+                aria-controls="signal-settings-panel"
+                onClick={() => setSignalSettingsOpen((open) => !open)}
+              >
+                <Settings2 size={15} aria-hidden="true" />
+                <span>Signal confirmation checks</span>
+                <small>{signalFactors.length} selected</small>
+                <ChevronRight
+                  size={14}
+                  className={signalSettingsOpen ? "expanded" : ""}
+                  aria-hidden="true"
+                />
+              </button>
+              {signalSettingsOpen && (
+                <div className="signal-settings-panel" id="signal-settings-panel">
+                  <p>
+                    Choose at least two checks. Every selected check must agree;
+                    a recent confirmed structure break is always required.
+                  </p>
+                  <div className="signal-factor-grid">
+                    {SIGNAL_FACTORS.map((factor) => {
+                      const checked = signalFactors.includes(factor.id);
+                      return (
+                        <label className="signal-factor" key={factor.id}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={checked && signalFactors.length <= 2}
+                            onChange={() => toggleSignalFactor(factor.id)}
+                          />
+                          <span>
+                            <strong>{factor.label}</strong>
+                            <small>{factor.description}</small>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <small className="signal-factor-note">
+                    SMA 200 needs 200 completed candles. Settings are saved on this device.
+                  </small>
                 </div>
-                {signalText}
-              </div>
+              )}
+            </section>
+            {aiText && <ChartInsight text={aiText} />}
+            {signalError && <div className="signal-error">{signalError}</div>}
+            {signalPlan && (
+              <section
+                className={`signal-output ${signalPlan.direction.toLowerCase()}`}
+                aria-live="polite"
+              >
+                <div className="signal-heading">
+                  <div className="signal-title-row">
+                    <span className="signal-badge">{signalPlan.direction}</span>
+                    <span className="signal-engine-tag">RULE-BASED · NO AI</span>
+                  </div>
+                  <small>
+                    {interval} · {signalPlan.time
+                      ? new Date(signalPlan.time * 1000).toLocaleString()
+                      : "Waiting for candle data"}
+                  </small>
+                </div>
+                <p className="signal-summary">{signalPlan.summary}</p>
+                <p className="signal-checks-used">
+                  Checks used: {signalPlan.selectedFactors
+                    .map((factor) => SIGNAL_FACTORS.find((item) => item.id === factor)?.label)
+                    .filter(Boolean)
+                    .join(" · ") || "none"}
+                  {" · structure break required"}
+                </p>
+                <div className="signal-levels">
+                  {signalPlan.direction === "WAIT" ? (
+                    <>
+                      <div>
+                        <span>LONG trigger · close above</span>
+                        <strong>
+                          {signalPlan.buyTrigger === null
+                            ? "—"
+                            : formatPrice(signalPlan.buyTrigger)}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>SHORT trigger · close below</span>
+                        <strong>
+                          {signalPlan.sellTrigger === null
+                            ? "—"
+                            : formatPrice(signalPlan.sellTrigger)}
+                        </strong>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <span>{signalPlan.direction} entry · candle close</span>
+                        <strong>{formatPrice(signalPlan.entry ?? 0)}</strong>
+                      </div>
+                      <div>
+                        <span>Exit if invalidated</span>
+                        <strong>{formatPrice(signalPlan.stop ?? 0)}</strong>
+                      </div>
+                      <div>
+                        <span>Target reference</span>
+                        <strong>{formatPrice(signalPlan.target ?? 0)}</strong>
+                      </div>
+                      <div>
+                        <span>Potential reward : risk</span>
+                        <strong>
+                          {signalPlan.rewardRisk === null
+                            ? "—"
+                            : `${signalPlan.rewardRisk.toFixed(2)} : 1`}
+                        </strong>
+                      </div>
+                    </>
+                  )}
+                </div>
+                {signalPlan.reasons.length > 0 && (
+                  <details className="signal-reasons">
+                    <summary>Why this result?</summary>
+                    <ul>
+                      {signalPlan.reasons.map((reason) => (
+                        <li key={reason}>{reason}</li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+                <div className="signal-chart-note">
+                  {signalPlan.direction === "WAIT"
+                    ? "Watch levels are drawn on the chart. No entry or exit is active."
+                    : "Entry, invalidation, and target are marked on the chart. These are reference levels, not orders."}
+                </div>
+              </section>
             )}
-            <p className="signal-warning">
-              <ShieldAlert size={13} /> AI signals are not financial advice.
-              They may be wrong and are followed entirely at your own risk.
-            </p>
+            {!/\b(?:risk note|not financial advice)\b/i.test(aiText) && (
+              <p className="signal-warning">
+                <ShieldAlert size={13} /> Signals are educational chart scenarios,
+                not financial advice. Crypto markets are volatile; a setup can fail.
+              </p>
+            )}
+            {createPortal(
+              <div className={`paper-dock${paperDockExpanded ? " is-expanded" : ""}`}>
+                {paperDockExpanded && (
+            <section className="paper-trading paper-dock-panel" id="paper-dock-panel" aria-labelledby="paper-trading-title">
+              <div className="paper-heading">
+                <span className="paper-icon"><Wallet size={16} aria-hidden="true" /></span>
+                <span className="paper-title-copy">
+                  <strong id="paper-trading-title">Demo trading</strong>
+                  <small>Paper positions · saved on this device</small>
+                </span>
+                <span className="paper-mode-tag">SIMULATION</span>
+              </div>
+              <div className="paper-account-grid">
+                <div><span>Balance</span><strong>{formatMoney(paperPortfolio.balance)}</strong></div>
+                <div><span>Equity</span><strong>{formatMoney(paperEquity)}</strong></div>
+                <div><span>Available</span><strong>{formatMoney(paperAvailable)}</strong></div>
+                <div>
+                  <span>Unrealized P&amp;L</span>
+                  <strong className={paperUnrealizedPnl === null ? "" : paperUnrealizedPnl >= 0 ? "positive" : "negative"}>
+                    {paperUnrealizedPnl === null ? "—" : formatMoney(paperUnrealizedPnl)}
+                  </strong>
+                </div>
+              </div>
+
+              {activePaperPosition && (
+                <div className={`paper-open-position ${activePaperPosition.direction.toLowerCase()}`}>
+                  <div className="paper-open-heading">
+                    <span className="paper-position-badge">OPEN · {activePaperPosition.direction}</span>
+                    <strong>{activePaperPosition.symbol} · {activePaperPosition.interval}</strong>
+                  </div>
+                  {paperPositionMatchesChart ? (
+                    <>
+                      <div className="paper-position-levels">
+                        <div><span>Entry</span><strong>{formatPrice(activePaperPosition.entry)}</strong></div>
+                        <div><span>Chart price</span><strong>{formatPrice(paperMarkPrice)}</strong></div>
+                        <div><span>Stop</span><strong>{formatPrice(activePaperPosition.stop)}</strong></div>
+                        <div><span>Target</span><strong>{formatPrice(activePaperPosition.target)}</strong></div>
+                        <div><span>Est. liquidation</span><strong>{formatPrice(activePaperPosition.liquidationPrice)}</strong></div>
+                        <div><span>Size · leverage</span><strong>{activePaperPosition.quantity.toLocaleString(undefined, { maximumFractionDigits: 8 })} · {activePaperPosition.leverage}×</strong></div>
+                      </div>
+                      <button className="paper-close-button" type="button" onClick={closePaperPositionAtMark}>
+                        Close demo position at chart price
+                      </button>
+                    </>
+                  ) : (
+                    <p className="paper-position-away">
+                      This position is on {activePaperPosition.provider.toUpperCase()}. Switch to that market and timeframe to manage it.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <div className="paper-setup">
+                <div className="paper-section-heading">
+                  <span>
+                    <strong>Position setup</strong>
+                    <small>Set direction, entry, stop, and target</small>
+                  </span>
+                </div>
+                <div className="paper-direction-switch" role="group" aria-label="Demo position direction">
+                  <button
+                    type="button"
+                    className={paperDirection === "LONG" ? "active long" : ""}
+                    aria-pressed={paperDirection === "LONG"}
+                    onClick={() => {
+                      setPaperDirection("LONG");
+                      setPaperStop("");
+                      setPaperTarget("");
+                      setPaperError("");
+                    }}
+                  ><ArrowUpRight size={14} /> LONG</button>
+                  <button
+                    type="button"
+                    className={paperDirection === "SHORT" ? "active short" : ""}
+                    aria-pressed={paperDirection === "SHORT"}
+                    onClick={() => {
+                      setPaperDirection("SHORT");
+                      setPaperStop("");
+                      setPaperTarget("");
+                      setPaperError("");
+                    }}
+                  ><ArrowDownRight size={14} /> SHORT</button>
+                  {signalPlan && signalPlan.direction !== "WAIT" && (
+                    <button className="paper-load-signal" type="button" onClick={loadSignalIntoPaperSetup}>
+                      Load signal levels
+                    </button>
+                  )}
+                </div>
+                <div className="paper-input-grid paper-level-inputs">
+                  <label>Entry
+                    <input type="number" min="0" step="any" placeholder="—" value={paperEntry || (current ? String(current.close) : "")} onChange={(event) => setPaperEntry(event.target.value)} />
+                  </label>
+                  <label>Stop
+                    <input type="number" min="0" step="any" placeholder="—" value={paperStop || (current ? String(defaultPaperStop) : "")} onChange={(event) => setPaperStop(event.target.value)} />
+                  </label>
+                  <label>Target
+                    <input type="number" min="0" step="any" placeholder="—" value={paperTarget || (current ? String(defaultPaperTarget) : "")} onChange={(event) => setPaperTarget(event.target.value)} />
+                  </label>
+                </div>
+                <div className="paper-input-grid paper-risk-inputs">
+                  <label>Risk per trade
+                    <span className="paper-suffix-field"><input type="number" min="0.1" max="5" step="0.1" value={paperRiskPercent} onChange={(event) => setPaperRiskPercent(event.target.value)} /><i>%</i></span>
+                  </label>
+                  <label>Leverage
+                    <span className="paper-suffix-field"><input type="number" min="1" max="50" step="1" value={paperLeverage} onChange={(event) => setPaperLeverage(event.target.value)} /><i>×</i></span>
+                  </label>
+                  <details className="paper-costs">
+                    <summary>Cost assumptions</summary>
+                    <div className="paper-input-grid">
+                      <label>Maintenance margin
+                        <span className="paper-suffix-field"><input type="number" min="0.01" max="10" step="0.01" value={paperMaintenanceMarginPercent} onChange={(event) => setPaperMaintenanceMarginPercent(event.target.value)} /><i>%</i></span>
+                      </label>
+                      <label>Fee per side
+                        <span className="paper-suffix-field"><input type="number" min="0" max="1" step="0.01" value={paperFeePercent} onChange={(event) => setPaperFeePercent(event.target.value)} /><i>%</i></span>
+                      </label>
+                    </div>
+                  </details>
+                </div>
+
+                {paperQuoteResult.quote ? (
+                  <>
+                    <div className="paper-quote-heading">
+                      <strong>Trade estimate</strong>
+                      <span>Updates with your setup</span>
+                    </div>
+                    <div className="paper-quote-grid">
+                      <div><span>Position size</span><strong>{paperQuoteResult.quote.quantity.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong></div>
+                      <div><span>Notional · margin</span><strong>{formatMoney(paperQuoteResult.quote.notional)} · {formatMoney(paperQuoteResult.quote.margin)}</strong></div>
+                      <div><span>Loss at stop</span><strong className="negative">−{formatMoney(paperQuoteResult.quote.stopLoss)}</strong></div>
+                      <div><span>Net at target</span><strong className="positive">+{formatMoney(paperQuoteResult.quote.targetProfit)}</strong></div>
+                      <div><span>Reward : risk</span><strong>{paperQuoteResult.quote.rewardRisk.toFixed(2)} : 1</strong></div>
+                      <div><span>Est. liquidation</span><strong>{formatPrice(paperQuoteResult.quote.liquidationPrice)}</strong></div>
+                      {paperQuoteResult.quote.isLeverageCapped && (
+                        <p className="paper-cap-note">Size is capped by demo balance and leverage.</p>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <p className="paper-form-error">{paperQuoteResult.error}</p>
+                )}
+                {paperError && <p className="paper-form-error" role="alert">{paperError}</p>}
+                <button
+                  className={`paper-open-button ${paperDirection.toLowerCase()}`}
+                  type="button"
+                  disabled={!paperQuoteResult.quote || Boolean(activePaperPosition) || !current}
+                  onClick={() => openPaperPosition()}
+                >
+                  {activePaperPosition ? "Close the open demo position first" : `Open ${paperDirection} demo position`}
+                </button>
+                <p className="paper-disclaimer">
+                  Local simulation only; no orders are sent. Assumes a USD/USDT linear contract. Stop/target fills use chart candles, with stop first if both are touched. The isolated liquidation price is a simplified estimate; exchange risk tiers, Mark Price, fees, funding, and slippage can change real outcomes.
+                </p>
+              </div>
+
+              <section className="copy-trading" aria-labelledby="copy-trading-title">
+                <div className="copy-heading">
+                  <span className="copy-icon"><Users size={15} aria-hidden="true" /></span>
+                  <span>
+                    <strong id="copy-trading-title">Demo copy trading</strong>
+                    <small><Radio size={10} aria-hidden="true" /> {copyStatus}</small>
+                  </span>
+                </div>
+                <p className="copy-description">
+                  Follow public demo traders. New LONG/SHORT entries and exits mirror into your own simulated account at your selected risk scale; an already-open trade is not joined mid-way.
+                </p>
+                <p className="copy-storage-note">
+                  {copySnapshot?.storageMode === "persistent"
+                    ? "Persistent shared room · updates while the app is open"
+                    : copySnapshot?.storageMode === "local-memory"
+                      ? "Local shared room · same server only; server restart clears trader profiles"
+                      : "Connecting to shared storage…"}
+                </p>
+                <div className="copy-profile-form">
+                  <label>
+                    Your trader name
+                    <input
+                      maxLength={24}
+                      value={copyNameDraft}
+                      onChange={(event) => setCopyNameDraft(event.target.value)}
+                      placeholder="Choose a name"
+                    />
+                  </label>
+                  <label className="copy-share-toggle">
+                    <input
+                      type="checkbox"
+                      checked={copyShareDraft}
+                      onChange={(event) => setCopyShareDraft(event.target.checked)}
+                    />
+                    <span>Let other users copy my demo trades</span>
+                  </label>
+                  <button
+                    className="copy-save-button"
+                    type="button"
+                    disabled={copySaving || !copySnapshot}
+                    onClick={() => void saveCopyProfile()}
+                  >
+                    {copySaving ? "Saving…" : "Save sharing settings"}
+                  </button>
+                </div>
+                {copyError && <p className="copy-error" role="alert">{copyError}</p>}
+                <div className="copy-trader-list">
+                  <div className="copy-list-heading">
+                    <strong>Traders to copy</strong>
+                    <span>{copySnapshot?.traders.filter((trader) =>
+                      trader.id !== copySnapshot.me.id &&
+                      (trader.isPublic || copySnapshot.follows.some((follow) => follow.traderId === trader.id)),
+                    ).length ?? 0} available</span>
+                  </div>
+                  {copySnapshot ? (
+                    copySnapshot.traders
+                      .filter((trader) =>
+                        trader.id !== copySnapshot.me.id &&
+                        (trader.isPublic || copySnapshot.follows.some((follow) => follow.traderId === trader.id)),
+                      )
+                      .map((trader) => {
+                        const follow = copySnapshot.follows.find((item) => item.traderId === trader.id);
+                        const copyScale = copyScaleDrafts[trader.id] ?? follow?.copyScale ?? 100;
+                        return (
+                          <article className="copy-trader-card" key={trader.id}>
+                            <div className="copy-trader-topline">
+                              <div>
+                                <strong>{trader.displayName}</strong>
+                                <small>{trader.totalTrades} closed demo trades · {formatMoney(trader.realizedPnl)} realized</small>
+                              </div>
+                              <span className={trader.currentTrade ? "copy-live-tag active" : "copy-live-tag"}>
+                                {trader.currentTrade ? "IN TRADE" : "FLAT"}
+                              </span>
+                            </div>
+                            {trader.currentTrade && (
+                              <div className={`copy-current-trade ${trader.currentTrade.position.direction.toLowerCase()}`}>
+                                <b>{trader.currentTrade.position.direction}</b>
+                                <span>{trader.currentTrade.position.symbol} · {trader.currentTrade.position.interval}</span>
+                                <small>Entry {formatPrice(trader.currentTrade.position.entry)}</small>
+                              </div>
+                            )}
+                            <div className="copy-trader-actions">
+                              <label>
+                                Copy size
+                                <select
+                                  value={copyScale}
+                                  onChange={(event) => {
+                                    const nextScale = Number(event.target.value);
+                                    setCopyScaleDrafts((current) => ({ ...current, [trader.id]: nextScale }));
+                                    if (follow?.enabled)
+                                      void updateCopyFollow(trader, true, nextScale);
+                                  }}
+                                  aria-label={`Copy size for ${trader.displayName}`}
+                                >
+                                  {[50, 75, 100, 150, 200].map((scale) => <option value={scale} key={scale}>{scale}% of their risk</option>)}
+                                </select>
+                              </label>
+                              <button
+                                className={follow?.enabled ? "copy-follow-button following" : "copy-follow-button"}
+                                type="button"
+                                disabled={copySaving}
+                                onClick={() => void updateCopyFollow(trader, !follow?.enabled, copyScale)}
+                              >
+                                <Copy size={12} aria-hidden="true" />
+                                {follow?.enabled ? "Pause" : follow ? "Resume" : "Copy trader"}
+                              </button>
+                            </div>
+                          </article>
+                        );
+                      })
+                  ) : (
+                    <p className="copy-empty">Connecting to the shared demo room…</p>
+                  )}
+                  {copySnapshot && !copySnapshot.traders.some((trader) => trader.id !== copySnapshot.me.id && (trader.isPublic || copySnapshot.follows.some((follow) => follow.traderId === trader.id))) && (
+                    <p className="copy-empty">No demo traders are sharing yet. Share your own demo trades to appear here.</p>
+                  )}
+                </div>
+                <p className="copy-disclaimer">Simulation only. Copying runs while this app is open, uses your demo balance, and never sends orders to an exchange.</p>
+              </section>
+
+              {paperPortfolio.history.length > 0 && (
+                <details className="paper-history">
+                  <summary>Recent demo trades ({paperPortfolio.history.length})</summary>
+                  <div className="paper-history-list">
+                    {paperPortfolio.history.slice(0, 5).map((trade) => (
+                      <div key={trade.id}>
+                        <span><b className={trade.direction.toLowerCase()}>{trade.direction}</b> {trade.symbol} · {trade.reason}</span>
+                        <strong className={trade.pnl >= 0 ? "positive" : "negative"}>{trade.pnl >= 0 ? "+" : "−"}{formatMoney(Math.abs(trade.pnl))}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </section>
+                )}
+                <div className="paper-dock-bar" aria-label="Demo trading controls">
+                  <div className="paper-dock-summary">
+                    <span className="paper-icon"><Wallet size={15} aria-hidden="true" /></span>
+                    <span className="paper-dock-copy">
+                      <strong>Demo</strong>
+                      <small title={activePaperPosition ? `${activePaperPosition.direction} · ${activePaperPosition.symbol}` : symbol}>
+                        {activePaperPosition
+                          ? `OPEN ${activePaperPosition.direction} · ${activePaperPosition.symbol}`
+                          : `${symbol} · ${formatMoney(paperPortfolio.balance)}`}
+                      </small>
+                    </span>
+                  </div>
+                  <label className="paper-dock-leverage">
+                    <span>LEV</span>
+                    <select
+                      aria-label="Demo leverage"
+                      value={paperLeverage}
+                      onChange={(event) => setPaperLeverage(event.target.value)}
+                    >
+                      {[1, 2, 3, 5, 10, 20, 50].map((leverage) => (
+                        <option value={leverage} key={leverage}>{leverage}×</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    className="paper-dock-action long"
+                    type="button"
+                    disabled={!current || Boolean(activePaperPosition)}
+                    title={activePaperPosition ? "Close the active demo position first" : "Open a LONG demo position"}
+                    onClick={() => openPaperPosition("LONG")}
+                  ><ArrowUpRight size={14} aria-hidden="true" /><span>LONG</span></button>
+                  <button
+                    className="paper-dock-action short"
+                    type="button"
+                    disabled={!current || Boolean(activePaperPosition)}
+                    title={activePaperPosition ? "Close the active demo position first" : "Open a SHORT demo position"}
+                    onClick={() => openPaperPosition("SHORT")}
+                  ><ArrowDownRight size={14} aria-hidden="true" /><span>SHORT</span></button>
+                  <button
+                    className={`paper-dock-expand${paperDockExpanded ? " expanded" : ""}`}
+                    type="button"
+                    aria-label={paperDockExpanded ? "Collapse demo trading details" : "Expand demo trading details"}
+                    aria-expanded={paperDockExpanded}
+                    aria-controls="paper-dock-panel"
+                    onClick={() => setPaperDockExpanded((expanded) => !expanded)}
+                  ><ChevronDown size={16} aria-hidden="true" /></button>
+                </div>
+              </div>,
+              document.body,
+            )}
             <p className="smallprint">
-              Rule-based SMC, Fibonacci and indicator analysis uses completed
-              candles and cannot guarantee future market movements.
+              Signals use completed candles and transparent trend, structure,
+              momentum, and ATR rules. Gemini is only used for optional explanations.
             </p>
           </div>
         </aside>
@@ -2572,9 +4855,9 @@ function App() {
             <div className="risk-icon">
               <ShieldAlert size={22} />
             </div>
-            <h3 id="risk-title">Before generating a signal</h3>
+            <h3 id="risk-title">Before reviewing a signal</h3>
             <p>
-              AI-generated market signals are educational only and are{" "}
+              These rule-based chart scenarios are educational only and are{" "}
               <strong>not financial advice</strong>. They can be inaccurate,
               incomplete, delayed, or entirely wrong.
             </p>
@@ -2604,7 +4887,7 @@ function App() {
                 disabled={!riskAcknowledged}
                 onClick={generateSignal}
               >
-                <Sparkles size={15} /> I understand — generate
+                <Activity size={15} /> I understand — review
               </button>
             </div>
           </div>

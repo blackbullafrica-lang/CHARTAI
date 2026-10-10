@@ -7,9 +7,11 @@ import http from "node:http";
 import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import copyTradingRouter from "./copyTrading.js";
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
+app.use("/api/copy-trading", copyTradingRouter);
 const allowedIntervals = new Set(["5m", "15m", "1h", "4h", "1d", "1w"]);
 const providers = new Set([
   "binance",
@@ -43,6 +45,21 @@ const apiBases = {
   hyperliquid: process.env.HYPERLIQUID_API_URL || "https://api.hyperliquid.xyz",
   mexc: process.env.MEXC_API_URL || "https://api.mexc.com",
 };
+const apiFallbackBases = {
+  binance: [
+    apiBases.binance,
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+  ],
+  okx: [
+    apiBases.okx,
+    "https://openapi.okx.com",
+    "https://www.okx.com",
+  ],
+};
+const preferredApiBases = new Map();
 function exchangeRequest(url, requestInit = {}, timeoutMs = 12000, hops = 0) {
   return new Promise((resolve, reject) => {
     const target = url instanceof URL ? url : new URL(url);
@@ -112,6 +129,42 @@ async function exchangeRequestWithRetry(
     }
   }
   throw lastError;
+}
+async function exchangeRequestForProvider(
+  provider,
+  originalUrl,
+  requestInit = {},
+  timeoutMs = 12000,
+  attempts = 2,
+) {
+  const original = originalUrl instanceof URL ? originalUrl : new URL(originalUrl);
+  const configured = apiFallbackBases[provider] || [original.origin];
+  const preferred = preferredApiBases.get(provider);
+  const bases = [preferred, ...configured]
+    .filter(Boolean)
+    .filter((base, index, values) => values.indexOf(base) === index);
+  let lastError;
+  let lastResponse;
+  for (const base of bases) {
+    const candidate = new URL(`${original.pathname}${original.search}`, base);
+    try {
+      const response = await exchangeRequestWithRetry(
+        candidate,
+        requestInit,
+        timeoutMs,
+        attempts,
+      );
+      if (response.ok) {
+        preferredApiBases.set(provider, base);
+        return response;
+      }
+      lastResponse = response;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastResponse) return lastResponse;
+  throw lastError || new Error(`${provider} API is unavailable`);
 }
 async function generateAi(contents) {
   const client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -213,18 +266,102 @@ function cleanAnalysis(value) {
   return value;
 }
 const marketCache = new Map();
+const marketRequests = new Map();
+function withTimeout(promise, timeoutMs, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 function normalizePair(symbol) {
-  if (!/^[\p{L}\p{N}]{2,40}$/u.test(symbol)) throw new Error("Invalid pair");
+  if (!isChartablePair(symbol)) throw new Error("Invalid pair");
   return symbol;
 }
-function okxPair(symbol) {
-  if (!symbol.endsWith("USDT"))
-    throw new Error("OKX Spot requires a USDT-quoted pair");
-  return `${symbol.slice(0, -4)}-USDT`;
+function isChartablePair(symbol) {
+  return /^[\p{L}\p{N}]{2,40}$/u.test(symbol);
+}
+function sortAndCacheMarkets(provider, markets) {
+  const quoteRank = new Map(
+    ["USDT", "USDC", "BTC", "ETH", "BNB", "EUR", "TRY"].map(
+      (quote, index) => [quote, index],
+    ),
+  );
+  const uniqueMarkets = new Map();
+  for (const market of markets) {
+    if (isChartablePair(market.symbol) && !uniqueMarkets.has(market.symbol))
+      uniqueMarkets.set(market.symbol, market);
+  }
+  const sorted = [...uniqueMarkets.values()].sort(
+    (a, b) =>
+      (quoteRank.get(a.quoteAsset) ?? 99) -
+        (quoteRank.get(b.quoteAsset) ?? 99) || a.symbol.localeCompare(b.symbol),
+  );
+  if (!sorted.length)
+    throw new Error(`${provider} returned an empty market catalog`);
+  marketCache.set(provider, { time: Date.now(), markets: sorted });
+  return sorted;
 }
 async function marketsFor(provider) {
   const cached = marketCache.get(provider);
   if (cached && Date.now() - cached.time < 300000) return cached.markets;
+  const pending = marketRequests.get(provider);
+  if (pending) return pending;
+  const request = loadMarketsFor(provider, cached);
+  marketRequests.set(provider, request);
+  try {
+    return await request;
+  } finally {
+    if (marketRequests.get(provider) === request) marketRequests.delete(provider);
+  }
+}
+async function loadMarketsFor(provider, cached) {
+  if (provider === "bybit") {
+    try {
+      const markets = [];
+      let cursor = "";
+      let pages = 0;
+      do {
+        const url = new URL("/v5/market/instruments-info", apiBases.bybit);
+        url.search = new URLSearchParams({
+          category: "linear",
+          status: "Trading",
+          limit: "1000",
+          ...(cursor ? { cursor } : {}),
+        }).toString();
+        const response = await exchangeRequestWithRetry(url, {}, 15000, 2);
+        if (!response.ok)
+          throw new Error(`bybit instruments API returned ${response.status}`);
+        const raw = await response.json();
+        if (raw.retCode !== 0 || !Array.isArray(raw.result?.list))
+          throw new Error(raw.retMsg || "Bybit instruments unavailable");
+        markets.push(
+          ...raw.result.list
+            .filter((symbol) => symbol.status === "Trading")
+            .map((symbol) => ({
+              symbol: symbol.symbol,
+              baseAsset: symbol.baseCoin,
+              quoteAsset: symbol.quoteCoin,
+            })),
+        );
+        const nextCursor = String(raw.result.nextPageCursor || "");
+        cursor = nextCursor && nextCursor !== cursor ? nextCursor : "";
+        pages += 1;
+      } while (cursor && pages < 20);
+      return sortAndCacheMarkets(provider, markets);
+    } catch (error) {
+      if (cached?.markets?.length) return cached.markets;
+      throw error;
+    }
+  }
   let url,
     transform,
     requestInit = {};
@@ -240,23 +377,6 @@ async function marketsFor(provider) {
           baseAsset: s.baseAsset,
           quoteAsset: s.quoteAsset,
         }));
-  } else if (provider === "bybit") {
-    url = new URL("/v5/market/instruments-info", apiBases.bybit);
-    url.search = new URLSearchParams({
-      category: "linear",
-      limit: "1000",
-    }).toString();
-    transform = (raw) => {
-      if (raw.retCode !== 0)
-        throw new Error(raw.retMsg || "Bybit instruments unavailable");
-      return raw.result.list
-        .filter((s) => s.status === "Trading")
-        .map((s) => ({
-          symbol: s.symbol,
-          baseAsset: s.baseCoin,
-          quoteAsset: s.quoteCoin,
-        }));
-    };
   } else if (provider === "okx") {
     url = new URL("/api/v5/public/instruments", apiBases.okx);
     url.search = new URLSearchParams({ instType: "SPOT" }).toString();
@@ -264,11 +384,12 @@ async function marketsFor(provider) {
       if (raw.code !== "0")
         throw new Error(raw.msg || "OKX instruments unavailable");
       return raw.data
-        .filter((s) => s.state === "live" && s.quoteCcy === "USDT")
+        .filter((s) => s.state === "live")
         .map((s) => ({
           symbol: s.instId.replaceAll("-", ""),
           baseAsset: s.baseCcy,
           quoteAsset: s.quoteCcy,
+          apiSymbol: s.instId,
         }));
     };
   } else if (provider === "aster") {
@@ -315,7 +436,7 @@ async function marketsFor(provider) {
       return raw.symbols
         .filter(
           (s) =>
-            ["ENABLED", "1"].includes(String(s.status)) &&
+            ["ENABLED", "1", "TRADING"].includes(String(s.status)) &&
             s.isSpotTradingAllowed !== false,
         )
         .map((s) => ({
@@ -325,29 +446,31 @@ async function marketsFor(provider) {
         }));
     };
   }
-  const response = await exchangeRequestWithRetry(
-    url,
-    requestInit,
-    provider === "mexc" ? 12000 : 15000,
-    ["binance", "okx"].includes(provider) ? 1 : 2,
-  );
-  if (!response.ok)
-    throw new Error(`${provider} instruments API returned ${response.status}`);
-  const quoteRank = new Map(
-    ["USDT", "USDC", "BTC", "ETH", "BNB", "EUR", "TRY"].map((quote, index) => [
-      quote,
-      index,
-    ]),
-  );
-  const markets = transform(await response.json()).sort(
-    (a, b) =>
-      (quoteRank.get(a.quoteAsset) ?? 99) -
-        (quoteRank.get(b.quoteAsset) ?? 99) || a.symbol.localeCompare(b.symbol),
-  );
-  marketCache.set(provider, { time: Date.now(), markets });
-  return markets;
+  try {
+    const response = ["binance", "okx"].includes(provider)
+      ? await exchangeRequestForProvider(
+          provider,
+          url,
+          requestInit,
+          6500,
+          1,
+        )
+      : await exchangeRequestWithRetry(
+          url,
+          requestInit,
+          provider === "mexc" ? 12000 : 15000,
+          2,
+        );
+    if (!response.ok)
+      throw new Error(`${provider} instruments API returned ${response.status}`);
+    return sortAndCacheMarkets(provider, transform(await response.json()));
+  } catch (error) {
+    if (cached?.markets?.length) return cached.markets;
+    throw error;
+  }
 }
-async function candlesFor(provider, symbol, interval) {
+async function candlesFor(provider, symbol, interval, requestedLimit = 500) {
+  const limit = Math.min(500, Math.max(2, Math.trunc(requestedLimit)));
   let url,
     transform,
     requestInit = {};
@@ -356,7 +479,7 @@ async function candlesFor(provider, symbol, interval) {
     url.search = new URLSearchParams({
       symbol,
       interval,
-      limit: "500",
+      limit: String(limit),
     }).toString();
     transform = (raw) => {
       if (!Array.isArray(raw))
@@ -377,7 +500,7 @@ async function candlesFor(provider, symbol, interval) {
       category: "linear",
       symbol,
       interval: intervalMap[interval],
-      limit: "500",
+      limit: String(limit),
     }).toString();
     transform = (raw) => {
       if (raw.retCode !== 0 || !raw.result?.list?.length)
@@ -392,11 +515,14 @@ async function candlesFor(provider, symbol, interval) {
       }));
     };
   } else if (provider === "okx") {
+    const markets = await marketsFor("okx");
+    const market = markets.find((item) => item.symbol === symbol);
+    if (!market?.apiSymbol) throw new Error("Pair not listed on OKX Spot");
     url = new URL("/api/v5/market/candles", apiBases.okx);
     url.search = new URLSearchParams({
-      instId: okxPair(symbol),
+      instId: market.apiSymbol,
       bar: okxMap[interval],
-      limit: "300",
+      limit: String(Math.min(limit, 300)),
     }).toString();
     transform = (raw) => {
       if (raw.code !== "0" || !raw.data?.length)
@@ -416,7 +542,7 @@ async function candlesFor(provider, symbol, interval) {
     url.search = new URLSearchParams({
       symbol,
       interval,
-      limit: "500",
+      limit: String(limit),
     }).toString();
     transform = (raw) => {
       if (!Array.isArray(raw) || !raw.length)
@@ -444,7 +570,7 @@ async function candlesFor(provider, symbol, interval) {
         "1w": 604800,
       }[interval],
       endTime = Date.now(),
-      startTime = endTime - seconds * 1000 * 500;
+      startTime = endTime - seconds * 1000 * limit;
     url = new URL("/info", apiBases.hyperliquid);
     requestInit = {
       method: "POST",
@@ -472,7 +598,7 @@ async function candlesFor(provider, symbol, interval) {
     url.search = new URLSearchParams({
       symbol,
       interval,
-      limit: "500",
+      limit: String(limit),
     }).toString();
     transform = (raw) => {
       if (!Array.isArray(raw) || !raw.length)
@@ -488,12 +614,9 @@ async function candlesFor(provider, symbol, interval) {
       }));
     };
   }
-  const response = await exchangeRequestWithRetry(
-    url,
-    requestInit,
-    15000,
-    2,
-  );
+  const response = ["binance", "okx"].includes(provider)
+    ? await exchangeRequestForProvider(provider, url, requestInit, 6500, 1)
+    : await exchangeRequestWithRetry(url, requestInit, 9000, 2);
   if (!response.ok)
     throw new Error(`${provider} market API returned ${response.status}`);
   const data = transform(await response.json()).sort((a, b) => a.time - b.time);
@@ -522,23 +645,16 @@ app.get("/api/markets", async (req, res) => {
       "binance",
       "okx",
     ];
-    const results = new Array(sources.length);
-    let cursor = 0;
-    async function loadNextMarketSource() {
-      while (cursor < sources.length) {
-        const index = cursor++;
-        const source = sources[index];
-        try {
-          results[index] = {
-            status: "fulfilled",
-            value: { source, markets: await marketsFor(source) },
-          };
-        } catch (reason) {
-          results[index] = { status: "rejected", reason };
-        }
-      }
-    }
-    await Promise.all([loadNextMarketSource(), loadNextMarketSource()]);
+    const results = await Promise.allSettled(
+      sources.map(async (source) => ({
+        source,
+        markets: await withTimeout(
+          marketsFor(source),
+          12000,
+          `${source} market catalog timed out`,
+        ),
+      })),
+    );
     const markets = results
       .flatMap((result) =>
         result.status === "fulfilled"
@@ -567,13 +683,31 @@ app.get("/api/markets", async (req, res) => {
           ]
         : [],
     );
+    res.setHeader(
+      "Cache-Control",
+      unavailable.length
+        ? "no-store"
+        : "public, max-age=60, s-maxage=300, stale-while-revalidate=86400",
+    );
+    if (!markets.length)
+      return res.status(503).json({
+        provider: "all",
+        markets: [],
+        unavailable: unavailable.length
+          ? unavailable
+          : [{ provider: "catalog", error: "No exchange catalogs are available" }],
+      });
     return res.json({ provider: "all", markets, unavailable });
   }
   if (!providers.has(provider))
     return res.status(400).json({ error: "Invalid exchange" });
   try {
     const markets = await marketsFor(provider);
-    res.json({ provider, markets });
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=60, s-maxage=300, stale-while-revalidate=86400",
+    );
+    res.json({ provider, markets: markets.map((market) => ({ ...market, provider })) });
   } catch (e) {
     res
       .status(502)
@@ -586,6 +720,10 @@ app.get("/api/klines", async (req, res) => {
   const provider = String(req.query.provider || "binance").toLowerCase();
   const symbol = String(req.query.symbol || "BTCUSDT").toUpperCase();
   const interval = String(req.query.interval || "4h");
+  const parsedLimit = Number(req.query.limit || 500);
+  const limit = Number.isFinite(parsedLimit)
+    ? Math.min(500, Math.max(2, Math.trunc(parsedLimit)))
+    : 500;
   if (
     !providers.has(provider) ||
     !allowedIntervals.has(interval) ||
@@ -595,7 +733,12 @@ app.get("/api/klines", async (req, res) => {
       .status(400)
       .json({ error: "Invalid exchange, trading pair or timeframe" });
   try {
-    const candles = await candlesFor(provider, normalizePair(symbol), interval);
+    const candles = await candlesFor(
+      provider,
+      normalizePair(symbol),
+      interval,
+      limit,
+    );
     if (candles.length < 2) throw new Error("Insufficient market candles");
     res.json({ provider, symbol, interval, candles });
   } catch (e) {
@@ -719,50 +862,6 @@ app.post("/api/explain", async (req, res) => {
       });
   }
 });
-app.post("/api/signal", async (req, res) => {
-  const { symbol, interval, analysis, provider, riskAcknowledged } =
-    req.body || {};
-  if (riskAcknowledged !== true)
-    return res
-      .status(400)
-      .json({
-        error: "Risk acknowledgement is required before generating a signal.",
-      });
-  if (
-    !/^[\p{L}\p{N}]{2,40}$/u.test(String(symbol || "")) ||
-    !allowedIntervals.has(interval) ||
-    !analysis ||
-    typeof analysis !== "object"
-  )
-    return res.status(400).json({ error: "Invalid signal request" });
-  if (!process.env.GEMINI_API_KEY)
-    return res
-      .status(503)
-      .json({
-        error:
-          "AI signals are not configured. Add GEMINI_API_KEY to server secrets.",
-      });
-  try {
-    const response = await generateAi(
-      `You generate cautious, educational crypto chart setups from validated technical-analysis JSON. This is not personalized financial advice. Use ONLY numbers present in the JSON, reproduce price levels exactly, and never invent or calculate new levels. If evidence is conflicting or there is no clean invalidation, return NO TRADE. Do not recommend leverage, position size, or immediate execution. Limit to 170 words. Start exactly with "Educational signal — NFA" and use sections: Bias, Confirmation required, Conditional entry area, Invalidation, Potential targets, Risk note. Every setup must be conditional and the Risk note must say the signal may be wrong and is followed entirely at the user's own risk. Exchange: ${provider || "unknown"}, Pair: ${symbol}, timeframe: ${interval}. JSON: ${JSON.stringify(cleanAnalysis(analysis)).slice(0, 14000)}`,
-    );
-    const signalText =
-      response.text?.trim() ||
-      "NO TRADE — the available evidence does not support a clean conditional setup.";
-    res.json({
-      text: signalText.startsWith("Educational signal — NFA")
-        ? signalText
-        : `Educational signal — NFA\n\n${signalText}`,
-    });
-  } catch (e) {
-    res
-      .status(502)
-      .json({
-        error:
-          "AI signal request failed. Check the Gemini key, quota and selected model.",
-      });
-  }
-});
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 const distPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -772,7 +871,5 @@ if (existsSync(path.join(distPath, "index.html"))) {
   app.use(express.static(distPath));
   app.get("*", (_req, res) => res.sendFile(path.join(distPath, "index.html")));
 }
-const port = Number(process.env.PORT || 3001);
-app.listen(port, "0.0.0.0", () =>
-  console.log(`Chart AI API listening on ${port}`),
-);
+
+export default app;
