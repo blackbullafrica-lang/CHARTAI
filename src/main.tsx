@@ -1,5 +1,6 @@
+"use client";
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   createChart,
@@ -43,6 +44,9 @@ import {
   Users,
   Radio,
   Copy,
+  Maximize2,
+  Minimize2,
+  Download,
 } from "lucide-react";
 import {
   analyze,
@@ -63,18 +67,41 @@ import { AnimatedCompanion } from "./AnimatedCompanion";
 import { PatternThumbnail } from "./PatternThumbnail";
 import {
   calculatePaperQuote,
+  estimatePaperBookFill,
+  estimatePaperLiquidationPrice,
   PAPER_STORAGE_KEY,
+  paperGrossPositionPnl,
   paperPositionPnl,
   readPaperPortfolio,
   type PaperClosedTrade,
   type PaperDirection,
   type PaperDirectionMode,
+  type PaperPendingOrder,
   type PaperPortfolio,
   type PaperPosition,
 } from "./paperTrading";
-import "./style.css";
 const intervals = ["5m", "15m", "1h", "4h", "1d", "1w"];
 const signalFactorsStorageKey = "chart-ai.signal-factors";
+const savedCandlesKey = (provider: string, symbol: string, interval: string) =>
+  `chart-ai.candles.v1:${provider}:${symbol}:${interval}`;
+function readSavedCandles(key: string): Candle[] {
+  try {
+    const saved: unknown = JSON.parse(window.localStorage.getItem(key) ?? "null");
+    if (!Array.isArray(saved)) return [];
+    return saved.filter((candle): candle is Candle =>
+      Boolean(candle) &&
+      typeof candle === "object" &&
+      Number.isFinite(candle.time) &&
+      Number.isFinite(candle.open) && candle.open > 0 &&
+      Number.isFinite(candle.high) && candle.high > 0 &&
+      Number.isFinite(candle.low) && candle.low > 0 &&
+      Number.isFinite(candle.close) && candle.close > 0 &&
+      Number.isFinite(candle.volume),
+    ).slice(-500);
+  } catch {
+    return [];
+  }
+}
 function readSavedSignalFactors(): SignalFactor[] {
   try {
     const saved: unknown = JSON.parse(
@@ -253,6 +280,38 @@ type DailyStats = {
   low: number;
   close: number;
 };
+type PaperLiveMark = {
+  positionId: string;
+  price: number;
+  markKind: "mark" | "last";
+  updatedAt: number;
+};
+type PaperMarkFeedState = "inactive" | "connecting" | "live" | "stale";
+type PaperOrderBookLevel = {
+  price: number;
+  size: number;
+  quoteSize: number;
+  cumulativeQuote: number;
+};
+type PaperOrderBook = {
+  provider: string;
+  symbol: string;
+  marketType: string;
+  source: "websocket" | "rest-snapshot";
+  bids: PaperOrderBookLevel[];
+  asks: PaperOrderBookLevel[];
+  bestBid: number;
+  bestAsk: number;
+  midPrice: number;
+  spread: number;
+  spreadPercent: number;
+  sequence: string | null;
+  exchangeTime: number;
+  updatedAt: number;
+};
+type PaperBookFeedState = "inactive" | "connecting" | "live" | "stale" | "reconnecting" | "syncing";
+type PaperHistoryFilter = "ALL" | "WINS" | "LOSSES";
+type PaperTerminalTab = "POSITIONS" | "OPEN_ORDERS" | "TRADE_HISTORY";
 type RangePeriod = "off" | "daily" | "weekly" | "monthly" | "yearly";
 type CandleReading = {
   name: string;
@@ -358,6 +417,14 @@ function formatMoney(amount: number) {
     currency: "USD",
     maximumFractionDigits: 2,
   });
+}
+function formatSignedMoney(amount: number) {
+  const sign = amount > 0 ? "+" : amount < 0 ? "−" : "";
+  return `${sign}${formatMoney(Math.abs(amount))}`;
+}
+function formatSignedPercent(percent: number) {
+  const sign = percent > 0 ? "+" : percent < 0 ? "−" : "";
+  return `${sign}${Math.abs(percent).toFixed(2)}%`;
 }
 function candleChangePercent(candle: Pick<Candle, "open" | "close">) {
   return candle.open
@@ -513,8 +580,138 @@ function recordPaperClose(
   return {
     balance: portfolio.balance + trade.pnl,
     openPosition: null,
-    history: [trade, ...portfolio.history].slice(0, 50),
+    pendingOrder: null,
+    history: [trade, ...portfolio.history].slice(0, 500),
   };
+}
+function downloadPaperPnlCard(trade: PaperClosedTrade) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1200;
+  canvas.height = 675;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+
+  const ctx = context;
+  const positive = trade.pnl >= 0;
+  const accent = positive ? "#53d6a4" : "#ff7d89";
+  const money = (value: number) => formatMoney(value);
+  const date = new Date(trade.closedAtTime * 1000);
+  const stamp = date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const roi = trade.margin > 0 ? (trade.pnl / trade.margin) * 100 : 0;
+  const roundedRect = (
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    radius: number,
+  ) => {
+    ctx.beginPath();
+    ctx.roundRect(x, y, width, height, radius);
+  };
+
+  const background = ctx.createLinearGradient(0, 0, 1200, 675);
+  background.addColorStop(0, "#101923");
+  background.addColorStop(0.56, "#111d29");
+  background.addColorStop(1, "#0b1118");
+  ctx.fillStyle = background;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  roundedRect(28, 28, 1144, 619, 28);
+  ctx.clip();
+  const glow = ctx.createRadialGradient(1030, 80, 20, 1030, 80, 500);
+  glow.addColorStop(0, positive ? "rgba(56, 177, 136, .17)" : "rgba(210, 79, 96, .17)");
+  glow.addColorStop(1, "rgba(16, 25, 35, 0)");
+  ctx.fillStyle = glow;
+  ctx.fillRect(28, 28, 1144, 619);
+  ctx.restore();
+  roundedRect(28, 28, 1144, 619, 28);
+  ctx.strokeStyle = "#2b3b49";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#dbe7ef";
+  ctx.font = "700 28px Inter, Segoe UI, sans-serif";
+  ctx.fillText("CHART AI", 72, 83);
+  ctx.fillStyle = "#8395a4";
+  ctx.font = "600 16px Inter, Segoe UI, sans-serif";
+  ctx.fillText("DEMO TRADE · SIMULATION", 72, 114);
+  roundedRect(930, 62, 194, 46, 23);
+  ctx.fillStyle = positive ? "rgba(42, 126, 96, .24)" : "rgba(145, 60, 70, .24)";
+  ctx.fill();
+  ctx.strokeStyle = positive ? "rgba(83, 214, 164, .45)" : "rgba(255, 125, 137, .45)";
+  ctx.stroke();
+  ctx.fillStyle = accent;
+  ctx.font = "800 15px Inter, Segoe UI, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(trade.direction, 1027, 85);
+  ctx.textAlign = "left";
+
+  ctx.fillStyle = "#f2f6f9";
+  ctx.font = "750 48px Inter, Segoe UI, sans-serif";
+  ctx.fillText(trade.symbol, 72, 190);
+  ctx.fillStyle = "#93a5b4";
+  ctx.font = "600 17px Inter, Segoe UI, sans-serif";
+  ctx.fillText(`${trade.provider.toUpperCase()}  ·  ${trade.leverage}× leverage  ·  ${stamp}`, 72, 226);
+
+  ctx.fillStyle = "#8698a7";
+  ctx.font = "700 16px Inter, Segoe UI, sans-serif";
+  ctx.fillText("NET REALIZED P&L", 72, 297);
+  ctx.fillStyle = accent;
+  ctx.font = "750 74px Inter, Segoe UI, sans-serif";
+  ctx.fillText(formatSignedMoney(trade.pnl), 68, 377);
+  roundedRect(72, 414, 132, 40, 20);
+  ctx.fillStyle = positive ? "rgba(42, 126, 96, .23)" : "rgba(145, 60, 70, .23)";
+  ctx.fill();
+  ctx.fillStyle = accent;
+  ctx.font = "750 17px Inter, Segoe UI, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(formatSignedPercent(roi), 138, 434);
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#8293a1";
+  ctx.font = "500 15px Inter, Segoe UI, sans-serif";
+  ctx.fillText("return on isolated margin", 222, 434);
+
+  ctx.strokeStyle = "#293845";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(72, 493);
+  ctx.lineTo(1128, 493);
+  ctx.stroke();
+  const detail = (x: number, label: string, value: string) => {
+    ctx.fillStyle = "#8293a1";
+    ctx.font = "600 14px Inter, Segoe UI, sans-serif";
+    ctx.fillText(label.toUpperCase(), x, 531);
+    ctx.fillStyle = "#dce6ed";
+    ctx.font = "700 19px Inter, Segoe UI, sans-serif";
+    ctx.fillText(value, x, 565);
+  };
+  detail(72, "Entry", formatPrice(trade.entry));
+  detail(320, "Exit", formatPrice(trade.exitPrice));
+  detail(548, "Position size", `${trade.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${trade.symbol.replace(/USDT$|USDC$|USD$/, "")}`);
+  detail(820, "Closed", trade.reason);
+
+  ctx.fillStyle = "#728493";
+  ctx.font = "500 13px Inter, Segoe UI, sans-serif";
+  ctx.fillText("Simulated performance · not an exchange statement or financial advice", 72, 612);
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#8fa1af";
+  ctx.font = "650 13px Inter, Segoe UI, sans-serif";
+  ctx.fillText(`Margin ${money(trade.margin)}`, 1128, 612);
+  ctx.textAlign = "left";
+
+  const safeSymbol = trade.symbol.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
+  const day = date.toISOString().slice(0, 10);
+  const link = document.createElement("a");
+  link.download = `chart-ai-${safeSymbol}-${trade.direction.toLowerCase()}-pnl-${day}.png`;
+  link.href = canvas.toDataURL("image/png");
+  link.click();
 }
 function recognizeCandlestick(candles: Candle[], index: number): CandleReading[] {
   const candle = candles[index];
@@ -826,6 +1023,16 @@ function App() {
   const [signalSettingsOpen, setSignalSettingsOpen] = useState(false);
   const [paperPortfolio, setPaperPortfolio] =
     useState<PaperPortfolio>(readPaperPortfolio);
+  const [paperHistoryFilter, setPaperHistoryFilter] =
+    useState<PaperHistoryFilter>("ALL");
+  const [paperTerminalTab, setPaperTerminalTab] =
+    useState<PaperTerminalTab>("POSITIONS");
+  const [paperLiveMark, setPaperLiveMark] = useState<PaperLiveMark | null>(null);
+  const [paperMarkFeedState, setPaperMarkFeedState] =
+    useState<PaperMarkFeedState>("inactive");
+  const [paperOrderBook, setPaperOrderBook] = useState<PaperOrderBook | null>(null);
+  const [paperBookFeedState, setPaperBookFeedState] =
+    useState<PaperBookFeedState>("inactive");
   const [copySnapshot, setCopySnapshot] = useState<CopySnapshot | null>(null);
   const [copyNameDraft, setCopyNameDraft] = useState("");
   const [copyShareDraft, setCopyShareDraft] = useState(false);
@@ -835,6 +1042,8 @@ function App() {
   const [copyScaleDrafts, setCopyScaleDrafts] = useState<Record<string, number>>({});
   const [paperDirection, setPaperDirection] =
     useState<PaperDirection>("LONG");
+  const [paperOrderType, setPaperOrderType] =
+    useState<"MARKET" | "LIMIT">("MARKET");
   const [paperEntry, setPaperEntry] = useState("");
   const [paperStop, setPaperStop] = useState("");
   const [paperTarget, setPaperTarget] = useState("");
@@ -845,6 +1054,7 @@ function App() {
   const [paperFeePercent, setPaperFeePercent] = useState("0.05");
   const [paperError, setPaperError] = useState("");
   const [paperDockExpanded, setPaperDockExpanded] = useState(false);
+  const [paperFullscreen, setPaperFullscreen] = useState(false);
   const [chatProvider, setChatProvider] = useState<AiProvider>("venice");
   const [chatProviders, setChatProviders] = useState<
     Record<AiProvider, boolean>
@@ -856,6 +1066,7 @@ function App() {
   const [chatError, setChatError] = useState("");
   const [infoDetail, setInfoDetail] = useState<InfoDetail | null>(null);
   const chartDiv = useRef<HTMLDivElement>(null);
+  const paperDockRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
@@ -878,6 +1089,7 @@ function App() {
   const candlesRef = useRef<Candle[]>([]);
   const marketsRef = useRef<Market[]>([]);
   const paperPortfolioRef = useRef(paperPortfolio);
+  const paperLiveMarkRef = useRef<PaperLiveMark | null>(null);
   const copySnapshotRef = useRef<CopySnapshot | null>(null);
   const copyCursorRef = useRef<number | null>(null);
   const copySyncBusyRef = useRef(false);
@@ -893,9 +1105,143 @@ function App() {
     moved: boolean;
   } | null>(null);
   const suppressZoneClickRef = useRef(false);
+  useEffect(() => {
+    const closeFallbackFullscreen = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        paperDockRef.current?.classList.contains("is-fullscreen")
+      ) {
+        setPaperFullscreen(false);
+      }
+    };
+    document.addEventListener("keydown", closeFallbackFullscreen);
+    return () => {
+      document.removeEventListener("keydown", closeFallbackFullscreen);
+    };
+  }, []);
+  useEffect(() => {
+    document.body.classList.toggle("paper-workspace-active", paperFullscreen);
+    return () => document.body.classList.remove("paper-workspace-active");
+  }, [paperFullscreen]);
+  function togglePaperFullscreen() {
+    if (paperFullscreen) {
+      setPaperFullscreen(false);
+      return;
+    }
+    setPaperDockExpanded(true);
+    setPaperFullscreen(true);
+  }
   function replacePaperPortfolio(next: PaperPortfolio) {
     paperPortfolioRef.current = next;
     setPaperPortfolio(next);
+  }
+  function replacePaperLiveMark(next: PaperLiveMark | null) {
+    paperLiveMarkRef.current = next;
+    setPaperLiveMark(next);
+  }
+  function processPaperMarketTick(
+    watchedTradeId: string,
+    price: number,
+    updatedAt: number,
+  ) {
+    let portfolio = paperPortfolioRef.current;
+    let position = portfolio.openPosition;
+    const pending = portfolio.pendingOrder;
+
+    if (!position && pending?.id === watchedTradeId) {
+      const isLong = pending.direction === "LONG";
+      const limitTriggered = isLong
+        ? price <= pending.limitPrice
+        : price >= pending.limitPrice;
+      if (!limitTriggered) return;
+
+      // A resting limit order receives the current mark when it is better than its limit.
+      const fillPrice = isLong
+        ? Math.min(price, pending.limitPrice)
+        : Math.max(price, pending.limitPrice);
+      position = {
+        id: pending.id,
+        direction: pending.direction,
+        provider: pending.provider,
+        symbol: pending.symbol,
+        interval: pending.interval,
+        openedAtTime: Math.floor(updatedAt / 1000),
+        entry: fillPrice,
+        stop: pending.stop,
+        target: pending.target,
+        quantity: pending.quantity,
+        leverage: pending.leverage,
+        margin: pending.quantity * fillPrice / pending.leverage,
+        liquidationPrice: estimatePaperLiquidationPrice(
+          fillPrice,
+          pending.direction,
+          pending.leverage,
+          pending.maintenanceMarginPercent,
+          pending.feeRate,
+        ),
+        riskAmount: Math.abs(fillPrice - pending.stop) * pending.quantity +
+          pending.quantity * (fillPrice + pending.stop) * pending.feeRate,
+        feeRate: pending.feeRate,
+        markPrice: price,
+      };
+      replacePaperPortfolio({
+        ...portfolio,
+        openPosition: position,
+        pendingOrder: null,
+      });
+      void publishCopyEvent("open", {
+        position,
+        accountBalance: portfolio.balance,
+      });
+      portfolio = paperPortfolioRef.current;
+    }
+
+    if (!position || position.id !== watchedTradeId) return;
+    const latestPortfolio = paperPortfolioRef.current;
+    if (latestPortfolio.openPosition?.id === position.id && position.markPrice !== price) {
+      position = { ...position, markPrice: price };
+      replacePaperPortfolio({ ...latestPortfolio, openPosition: position });
+    }
+    const isLong = position.direction === "LONG";
+    const liquidationHit = isLong
+      ? price <= position.liquidationPrice
+      : price >= position.liquidationPrice;
+    const stopHit = isLong ? price <= position.stop : price >= position.stop;
+    const targetHit = isLong ? price >= position.target : price <= position.target;
+    if (!liquidationHit && !stopHit && !targetHit) return;
+
+    const reason: PaperClosedTrade["reason"] = liquidationHit
+      ? "Estimated liquidation"
+      : stopHit
+        ? "Stop hit"
+        : "Target hit";
+    const exitPrice = liquidationHit
+      ? price
+      : stopHit
+        ? isLong
+          ? Math.min(price, position.stop)
+          : Math.max(price, position.stop)
+        : isLong
+          ? Math.max(price, position.target)
+          : Math.min(price, position.target);
+    portfolio = paperPortfolioRef.current;
+    if (portfolio.openPosition?.id !== position.id) return;
+    const closedPortfolio = recordPaperClose(
+      portfolio,
+      position,
+      exitPrice,
+      Math.floor(updatedAt / 1000),
+      reason,
+    );
+    replacePaperPortfolio(closedPortfolio);
+    if (!position.copiedFrom)
+      void publishCopyEvent("close", {
+        positionId: position.id,
+        exitPrice,
+        closedAtTime: Math.floor(updatedAt / 1000),
+        reason,
+        pnl: closedPortfolio.history[0]?.pnl || 0,
+      });
   }
   function applyCopiedPosition(
     trader: CopyProfile,
@@ -908,8 +1254,8 @@ function App() {
       setCopyStatus(`Copying ${trader.displayName} · ${source.symbol}`);
       return true;
     }
-    if (currentPortfolio.openPosition) {
-      setCopyStatus(`Skipped ${trader.displayName}'s ${source.symbol} entry · close your open demo position first.`);
+    if (currentPortfolio.openPosition || currentPortfolio.pendingOrder) {
+      setCopyStatus(`Skipped ${trader.displayName}'s ${source.symbol} entry · manage your current demo trade first.`);
       return false;
     }
     const sourceRiskPercent =
@@ -1707,11 +2053,35 @@ function App() {
     let heartbeat: number | undefined;
     let loadFailures = 0;
     let activeLoadController: AbortController | null = null;
-    setLoading(true);
+    const candleKey = savedCandlesKey(provider, symbol, interval);
+    const savedCandles = readSavedCandles(candleKey);
+    if (savedCandles.length >= 2) {
+      candlesRef.current = savedCandles;
+      setCandles(savedCandles);
+      seriesRef.current?.setData(
+        savedCandles.map((candle) => ({
+          time: candle.time as Time,
+          open: candle.open,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+        })),
+      );
+      volumeRef.current?.setData(
+        savedCandles.map((candle) => ({
+          time: candle.time as Time,
+          value: candle.volume,
+          color: candle.close >= candle.open ? "#18ad7e45" : "#e75e6845",
+        })),
+      );
+      chartRef.current?.timeScale().fitContent();
+    } else {
+      candlesRef.current = [];
+      setCandles([]);
+    }
+    setLoading(savedCandles.length < 2);
     setError("");
     setLive(false);
-    setCandles([]);
-    candlesRef.current = [];
     setSelectedCandle(null);
     setAiText("");
     setSignalPlan(null);
@@ -1738,9 +2108,14 @@ function App() {
           throw new Error(body.error || "Market data unavailable");
         if (cancelled) return;
         loadFailures = 0;
-        setError("");
+        setError(body.stale ? body.warning || "Showing the last saved candles." : "");
         candlesRef.current = body.candles;
         setCandles(body.candles);
+        try {
+          window.localStorage.setItem(candleKey, JSON.stringify(body.candles));
+        } catch {
+          // The chart still works when browser storage is unavailable.
+        }
         const latest = body.candles[body.candles.length - 1] as Candle;
         setTimeframeChanges((current) => ({
           ...current,
@@ -1784,7 +2159,7 @@ function App() {
           const message = e instanceof Error
             ? e.message
             : "Failed to load market data";
-          setError(`${message} · retrying in ${Math.ceil(delay / 1000)}s`);
+          setError(`${message} · ${candlesRef.current.length >= 2 ? "showing saved candles · " : ""}retrying in ${Math.ceil(delay / 1000)}s`);
           setLoading(false);
           dataRetry = window.setTimeout(() => {
             dataRetry = undefined;
@@ -1808,7 +2183,27 @@ function App() {
         next = [...current, c].sort((a, b) => a.time - b.time).slice(-500);
       }
       candlesRef.current = next;
+      const activeTrade = paperPortfolioRef.current.openPosition ??
+        paperPortfolioRef.current.pendingOrder;
+      const lastPaperMark = paperLiveMarkRef.current;
+      if (
+        activeTrade?.provider === provider &&
+        activeTrade.symbol === symbol &&
+        (lastPaperMark?.positionId !== activeTrade.id ||
+          Date.now() - lastPaperMark.updatedAt >= 6000)
+      ) {
+        // If the exchange mark endpoint is delayed, keep the demo position tied
+        // to the exact last-traded price being drawn by this live chart.
+        processPaperMarketTick(activeTrade.id, c.close, Date.now());
+      }
       setCandles(next);
+      if (c.closed) {
+        try {
+          window.localStorage.setItem(candleKey, JSON.stringify(next));
+        } catch {
+          // Keep the live chart usable even when local storage is full or blocked.
+        }
+      }
       setTimeframeChanges((current) => ({
         ...current,
         [interval]: candleChangePercent(c),
@@ -2180,15 +2575,15 @@ function App() {
   useEffect(() => {
     const series = seriesRef.current;
     const position = paperPortfolio.openPosition;
+    const pendingOrder = paperPortfolio.pendingOrder;
     for (const priceLine of paperPriceLinesRef.current)
       series?.removePriceLine(priceLine);
     paperPriceLinesRef.current = [];
     if (
       !series ||
-      !position ||
-      position.provider !== provider ||
-      position.symbol !== symbol ||
-      position.interval !== interval
+      (!position && !pendingOrder) ||
+      (position && (position.provider !== provider || position.symbol !== symbol)) ||
+      (pendingOrder && (pendingOrder.provider !== provider || pendingOrder.symbol !== symbol))
     ) return;
 
     const addPaperLine = (
@@ -2211,17 +2606,33 @@ function App() {
         }),
       );
     };
-    addPaperLine(position.entry, `DEMO ${position.direction}`, "#69a9ff", LineStyle.Solid);
-    addPaperLine(position.stop, "DEMO STOP", "#ef7782", LineStyle.Dashed);
-    addPaperLine(position.target, "DEMO TARGET", "#45d6a3", LineStyle.Dashed);
-    addPaperLine(position.liquidationPrice, "EST. LIQ.", "#d58cff", LineStyle.Dotted);
+    if (position) {
+      const exchangeMark = paperLiveMark?.positionId === position.id &&
+        paperMarkFeedState === "live" &&
+        Date.now() - paperLiveMark.updatedAt < 6000
+        ? paperLiveMark.price
+        : null;
+      const lastChartPrice = position.provider === provider && position.symbol === symbol
+        ? candlesRef.current[candlesRef.current.length - 1]?.close
+        : null;
+      const liveMark = exchangeMark ?? lastChartPrice ?? position.markPrice;
+      addPaperLine(position.entry, `DEMO ${position.direction} ENTRY`, "#69a9ff", LineStyle.Solid);
+      addPaperLine(liveMark, "DEMO P&L PRICE", "#f0bd69", LineStyle.Dotted);
+      addPaperLine(position.stop, "DEMO STOP", "#ef7782", LineStyle.Dashed);
+      addPaperLine(position.target, "DEMO TARGET", "#45d6a3", LineStyle.Dashed);
+      addPaperLine(position.liquidationPrice, "EST. LIQ.", "#d58cff", LineStyle.Dotted);
+    } else if (pendingOrder) {
+      addPaperLine(pendingOrder.limitPrice, `PENDING ${pendingOrder.direction}`, "#69a9ff", LineStyle.Dotted);
+      addPaperLine(pendingOrder.stop, "PENDING STOP", "#ef7782", LineStyle.Dashed);
+      addPaperLine(pendingOrder.target, "PENDING TARGET", "#45d6a3", LineStyle.Dashed);
+    }
     chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
     return () => {
       for (const priceLine of paperPriceLinesRef.current)
         series.removePriceLine(priceLine);
       paperPriceLinesRef.current = [];
     };
-  }, [interval, paperPortfolio.openPosition, provider, symbol]);
+  }, [candles, interval, paperPortfolio.openPosition, paperPortfolio.pendingOrder, paperLiveMark, paperMarkFeedState, provider, symbol]);
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
@@ -2527,9 +2938,32 @@ function App() {
     };
   }, [candles, focusedPattern]);
   const current = candles.length ? candles[candles.length - 1] : null;
-  const paperEntryValue = paperEntry.trim()
+  const matchingPaperOrderBook = paperOrderBook?.provider === provider &&
+    paperOrderBook.symbol === symbol
+    ? paperOrderBook
+    : null;
+  const paperBookIsFresh = Boolean(
+    matchingPaperOrderBook &&
+    matchingPaperOrderBook.source === "websocket" &&
+    paperBookFeedState === "live" &&
+    Date.now() - matchingPaperOrderBook.updatedAt < 5000,
+  );
+  const paperExecutablePrice = matchingPaperOrderBook
+    ? paperDirection === "LONG"
+      ? matchingPaperOrderBook.bestAsk
+      : matchingPaperOrderBook.bestBid
+    : null;
+  const paperLimitPriceValue = paperEntry.trim()
     ? Number(paperEntry)
     : current?.close ?? 0;
+  const paperLimitIsMarketable = Boolean(paperBookIsFresh && matchingPaperOrderBook && (
+    paperDirection === "LONG"
+      ? paperLimitPriceValue >= matchingPaperOrderBook.bestAsk
+      : paperLimitPriceValue <= matchingPaperOrderBook.bestBid
+  ));
+  const paperEntryValue = paperOrderType === "MARKET" || paperLimitIsMarketable
+    ? paperExecutablePrice ?? current?.close ?? 0
+    : paperLimitPriceValue;
   const paperStopDistance = Math.max(
     (analysis?.atr ?? paperEntryValue * 0.01) * 1.5,
     paperEntryValue * 0.001,
@@ -2544,7 +2978,7 @@ function App() {
   const paperTargetValue = paperTarget.trim()
     ? Number(paperTarget)
     : defaultPaperTarget;
-  const paperQuoteResult = current
+  const paperQuoteResult = current && (paperOrderType !== "MARKET" || paperBookIsFresh)
     ? calculatePaperQuote({
         direction: paperDirection,
         entry: paperEntryValue,
@@ -2556,22 +2990,229 @@ function App() {
         feePercent: Number(paperFeePercent),
         balance: paperPortfolio.balance,
       })
-    : { quote: null, error: "Waiting for price data." };
+    : {
+        quote: null,
+        error: current
+          ? "Waiting for a synchronized live order book before market execution."
+          : "Waiting for price data.",
+      };
   const activePaperPosition = paperPortfolio.openPosition;
-  const paperPositionMatchesChart = Boolean(
-    activePaperPosition &&
+  const canSubmitPaperDirection = (direction: PaperDirection) => {
+    if (!current || paperPortfolio.pendingOrder) return false;
+    if (paperOrderType === "MARKET" && !paperBookIsFresh) return false;
+    if (!activePaperPosition) return true;
+    return activePaperPosition.provider === provider &&
+      activePaperPosition.symbol === symbol &&
+      activePaperPosition.direction !== direction &&
+      paperOrderType === "MARKET";
+  };
+  const paperCanReverseAtMarket = Boolean(
+    activePaperPosition && canSubmitPaperDirection(paperDirection),
+  );
+  const paperHistoryNetPnl = paperPortfolio.history.reduce(
+    (total, trade) => total + trade.pnl,
+    0,
+  );
+  const paperHistoryWins = paperPortfolio.history.filter((trade) => trade.pnl > 0).length;
+  const paperHistoryWinRate = paperPortfolio.history.length
+    ? (paperHistoryWins / paperPortfolio.history.length) * 100
+    : 0;
+  const visiblePaperHistory = paperPortfolio.history.filter((trade) =>
+    paperHistoryFilter === "ALL" ||
+    (paperHistoryFilter === "WINS" ? trade.pnl > 0 : trade.pnl <= 0),
+  );
+  const paperBookDepthMax = matchingPaperOrderBook
+    ? Math.max(
+        1,
+        ...matchingPaperOrderBook.bids.map((level) => level.cumulativeQuote),
+        ...matchingPaperOrderBook.asks.map((level) => level.cumulativeQuote),
+      )
+    : 1;
+  const displayedPaperAsks = matchingPaperOrderBook
+    ? [...matchingPaperOrderBook.asks].slice(0, 8).reverse()
+    : [];
+  const displayedPaperBids = matchingPaperOrderBook
+    ? matchingPaperOrderBook.bids.slice(0, 8)
+    : [];
+  const watchedPaperTrade = activePaperPosition ?? paperPortfolio.pendingOrder;
+  const watchedPaperTradeKind = activePaperPosition
+    ? "position"
+    : paperPortfolio.pendingOrder
+      ? "order"
+      : "inactive";
+  const watchedPaperTradeId = watchedPaperTrade?.id ?? null;
+  const watchedPaperProvider = watchedPaperTrade?.provider ?? null;
+  const watchedPaperSymbol = watchedPaperTrade?.symbol ?? null;
+  const matchedPaperLiveMark = activePaperPosition &&
+    paperLiveMark?.positionId === activePaperPosition.id
+    ? paperLiveMark
+    : null;
+  const matchedPendingLiveMark = paperPortfolio.pendingOrder &&
+    paperLiveMark?.positionId === paperPortfolio.pendingOrder.id
+    ? paperLiveMark
+    : null;
+  const chartPaperPrice = activePaperPosition &&
     activePaperPosition.provider === provider &&
     activePaperPosition.symbol === symbol &&
-    activePaperPosition.interval === interval,
-  );
-  const paperMarkPrice = paperPositionMatchesChart && current
+    current && Number.isFinite(current.close) && current.close > 0
     ? current.close
-    : activePaperPosition?.markPrice ?? 0;
-  const paperUnrealizedPnl = paperPositionMatchesChart && activePaperPosition && current
-    ? paperPositionPnl(activePaperPosition, current.close)
     : null;
+  const exchangeMarkIsFresh = Boolean(
+    matchedPaperLiveMark &&
+    paperMarkFeedState === "live" &&
+    Date.now() - matchedPaperLiveMark.updatedAt < 6000,
+  );
+  const paperMarkPrice = exchangeMarkIsFresh && matchedPaperLiveMark
+    ? matchedPaperLiveMark.price
+    : chartPaperPrice ?? activePaperPosition?.markPrice ?? activePaperPosition?.entry ?? 0;
+  const paperMarkIsLive = Boolean(
+    exchangeMarkIsFresh || (!exchangeMarkIsFresh && chartPaperPrice !== null && live),
+  );
+  const paperPriceSourceLabel = exchangeMarkIsFresh
+    ? `EXCHANGE ${matchedPaperLiveMark?.markKind.toUpperCase()}`
+    : chartPaperPrice !== null
+      ? live ? "LIVE CHART LAST" : "CHART LAST"
+      : "LAST SAVED PRICE";
+  const paperUnrealizedPnl = activePaperPosition && paperMarkPrice > 0
+    ? paperGrossPositionPnl(activePaperPosition, paperMarkPrice)
+    : null;
+  const paperEstimatedNetClosePnl = activePaperPosition && paperMarkPrice > 0
+    ? paperPositionPnl(activePaperPosition, paperMarkPrice)
+    : null;
+  const paperUnrealizedReturn =
+    paperUnrealizedPnl !== null && activePaperPosition && activePaperPosition.margin > 0
+      ? (paperUnrealizedPnl / activePaperPosition.margin) * 100
+      : null;
+  const paperOutcomeClass = paperUnrealizedPnl === null
+    ? ""
+    : paperUnrealizedPnl > 0
+      ? "positive"
+      : paperUnrealizedPnl < 0
+        ? "negative"
+        : "neutral";
   const paperEquity = paperPortfolio.balance + (paperUnrealizedPnl ?? 0);
-  const paperAvailable = paperPortfolio.balance - (activePaperPosition?.margin ?? 0);
+  const paperAvailable = paperPortfolio.balance -
+    (activePaperPosition?.margin ?? 0) -
+    (paperPortfolio.pendingOrder?.margin ?? 0);
+  useEffect(() => {
+    if (!watchedPaperTradeId || !watchedPaperProvider || !watchedPaperSymbol) {
+      replacePaperLiveMark(null);
+      setPaperMarkFeedState("inactive");
+      return;
+    }
+
+    const positionId = watchedPaperTradeId;
+    const markProvider = watchedPaperProvider;
+    const markSymbol = watchedPaperSymbol;
+    let cancelled = false;
+    let retryTimer: number | undefined;
+    let controller: AbortController | null = null;
+    let retryDelay = 1200;
+    replacePaperLiveMark(null);
+    setPaperMarkFeedState("connecting");
+
+    async function pollMarkPrice() {
+      controller = new AbortController();
+      try {
+        const response = await fetch(
+          `/api/mark-price?provider=${encodeURIComponent(markProvider)}&symbol=${encodeURIComponent(markSymbol)}`,
+          { cache: "no-store", signal: controller.signal },
+        );
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || "Price feed unavailable");
+        const price = Number(body.price);
+        if (!Number.isFinite(price) || price <= 0)
+          throw new Error("Exchange returned an invalid mark price");
+        if (cancelled) return;
+
+        const updatedAt = Number(body.updatedAt) || Date.now();
+        const mark: PaperLiveMark = {
+          positionId,
+          price,
+          markKind: body.markKind === "mark" ? "mark" : "last",
+          updatedAt,
+        };
+        replacePaperLiveMark(mark);
+        setPaperMarkFeedState("live");
+        processPaperMarketTick(positionId, price, updatedAt);
+        retryDelay = 1200;
+      } catch {
+        if (!cancelled) {
+          setPaperMarkFeedState("stale");
+          retryDelay = Math.min(8000, Math.max(2000, retryDelay * 1.5));
+        }
+      } finally {
+        if (!cancelled) retryTimer = window.setTimeout(pollMarkPrice, retryDelay);
+      }
+    }
+
+    void pollMarkPrice();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(retryTimer);
+      controller?.abort();
+    };
+  }, [
+    watchedPaperTradeId,
+    watchedPaperTradeKind,
+    watchedPaperProvider,
+    watchedPaperSymbol,
+  ]);
+  useEffect(() => {
+    setPaperOrderBook(null);
+    setPaperBookFeedState("connecting");
+    const stream = new EventSource(
+      `/api/orderbook/stream?provider=${encodeURIComponent(provider)}&symbol=${encodeURIComponent(symbol)}`,
+    );
+    stream.onmessage = (event) => {
+      try {
+        const update = JSON.parse(event.data) as Record<string, unknown>;
+        if (update.type === "state") {
+          const state = String(update.state || "stale");
+          if (["connecting", "live", "stale", "reconnecting", "syncing"].includes(state))
+            setPaperBookFeedState(state as PaperBookFeedState);
+          return;
+        }
+        if (update.type !== "book" || update.provider !== provider || update.symbol !== symbol) return;
+        setPaperOrderBook({
+          provider,
+          symbol,
+          marketType: String(update.marketType || "spot"),
+          source: "websocket",
+          bids: Array.isArray(update.bids) ? update.bids as PaperOrderBookLevel[] : [],
+          asks: Array.isArray(update.asks) ? update.asks as PaperOrderBookLevel[] : [],
+          bestBid: Number(update.bestBid),
+          bestAsk: Number(update.bestAsk),
+          midPrice: Number(update.midPrice),
+          spread: Number(update.spread),
+          spreadPercent: Number(update.spreadPercent),
+          sequence: update.sequence === null ? null : String(update.sequence || ""),
+          exchangeTime: Number(update.exchangeTime) || Date.now(),
+          updatedAt: Number(update.updatedAt) || Date.now(),
+        });
+        setPaperBookFeedState("live");
+      } catch {
+        setPaperBookFeedState("stale");
+      }
+    };
+    stream.onopen = () => {
+      setPaperBookFeedState((state) => state === "live" ? state : "connecting");
+    };
+    stream.onerror = () => {
+      setPaperBookFeedState((state) => state === "live" ? state : "reconnecting");
+    };
+    return () => {
+      stream.close();
+    };
+  }, [provider, symbol]);
+  useEffect(() => {
+    if (!paperOrderBook || paperOrderBook.provider !== provider || paperOrderBook.symbol !== symbol) return;
+    const updatedAt = paperOrderBook.updatedAt;
+    const timer = window.setTimeout(() => {
+      setPaperBookFeedState((state) => state === "live" ? "stale" : state);
+    }, Math.max(0, 5000 - (Date.now() - updatedAt)));
+    return () => window.clearTimeout(timer);
+  }, [paperOrderBook?.updatedAt, paperOrderBook?.provider, paperOrderBook?.symbol, provider, symbol]);
   const activeTimeframeChange = current
     ? candleChangePercent(current)
     : timeframeChanges[interval];
@@ -2591,6 +3232,122 @@ function App() {
     : null;
   useEffect(() => {
     const position = paperPortfolio.openPosition;
+    const pendingOrder = paperPortfolio.pendingOrder;
+    if (!position && pendingOrder) {
+      const orderMatchesChart = pendingOrder.provider === provider &&
+        pendingOrder.symbol === symbol && pendingOrder.interval === interval;
+      if (!orderMatchesChart) return;
+
+      for (const candle of candles) {
+        if (candle.time < pendingOrder.placedAtTime) continue;
+        const isLong = pendingOrder.direction === "LONG";
+        const crossed = isLong
+          ? (candle.closed && candle.time > pendingOrder.placedAtTime
+              ? candle.low <= pendingOrder.limitPrice
+              : candle.close <= pendingOrder.limitPrice)
+          : (candle.closed && candle.time > pendingOrder.placedAtTime
+              ? candle.high >= pendingOrder.limitPrice
+              : candle.close >= pendingOrder.limitPrice);
+        if (!crossed) continue;
+
+        // A gap through a limit order receives the better opening price.
+        const fillPrice = candle.time > pendingOrder.placedAtTime
+          ? isLong
+            ? Math.min(pendingOrder.limitPrice, candle.open)
+            : Math.max(pendingOrder.limitPrice, candle.open)
+          : isLong
+            ? Math.min(pendingOrder.limitPrice, candle.close)
+            : Math.max(pendingOrder.limitPrice, candle.close);
+        const margin = pendingOrder.quantity * fillPrice / pendingOrder.leverage;
+        const liquidationPrice = estimatePaperLiquidationPrice(
+          fillPrice,
+          pendingOrder.direction,
+          pendingOrder.leverage,
+          pendingOrder.maintenanceMarginPercent,
+          pendingOrder.feeRate,
+        );
+        const positionOnFill: PaperPosition = {
+          id: pendingOrder.id,
+          direction: pendingOrder.direction,
+          provider: pendingOrder.provider,
+          symbol: pendingOrder.symbol,
+          interval: pendingOrder.interval,
+          openedAtTime: candle.time,
+          entry: fillPrice,
+          stop: pendingOrder.stop,
+          target: pendingOrder.target,
+          quantity: pendingOrder.quantity,
+          leverage: pendingOrder.leverage,
+          margin,
+          liquidationPrice,
+          riskAmount: Math.abs(fillPrice - pendingOrder.stop) * pendingOrder.quantity +
+            pendingOrder.quantity * (fillPrice + pendingOrder.stop) * pendingOrder.feeRate,
+          feeRate: pendingOrder.feeRate,
+          markPrice: candle.close,
+        };
+        const portfolio = paperPortfolioRef.current;
+        if (portfolio.pendingOrder?.id !== pendingOrder.id) return;
+        const filledPortfolio: PaperPortfolio = {
+          ...portfolio,
+          openPosition: positionOnFill,
+          pendingOrder: null,
+        };
+        const accountBalance = portfolio.balance;
+        const sameCandleAsPlacement = candle.time === pendingOrder.placedAtTime;
+        const liquidationHit = sameCandleAsPlacement
+          ? (isLong
+              ? fillPrice <= positionOnFill.liquidationPrice
+              : fillPrice >= positionOnFill.liquidationPrice)
+          : (isLong
+              ? candle.open <= positionOnFill.liquidationPrice
+              : candle.open >= positionOnFill.liquidationPrice);
+        const stopHit = sameCandleAsPlacement
+          ? (isLong ? fillPrice <= positionOnFill.stop : fillPrice >= positionOnFill.stop)
+          : (isLong ? candle.low <= positionOnFill.stop : candle.high >= positionOnFill.stop);
+        const targetHit = sameCandleAsPlacement
+          ? (isLong ? fillPrice >= positionOnFill.target : fillPrice <= positionOnFill.target)
+          : (isLong ? candle.high >= positionOnFill.target : candle.low <= positionOnFill.target);
+        if (liquidationHit || stopHit || targetHit) {
+          const reason = liquidationHit
+            ? "Estimated liquidation"
+            : stopHit
+              ? "Stop hit"
+              : "Target hit";
+          const exitPrice = sameCandleAsPlacement
+            ? fillPrice
+            : liquidationHit
+              ? candle.open
+              : stopHit
+                ? isLong
+                  ? Math.min(candle.open, positionOnFill.stop)
+                  : Math.max(candle.open, positionOnFill.stop)
+                : positionOnFill.target;
+          const closedPortfolio = recordPaperClose(
+            filledPortfolio,
+            positionOnFill,
+            exitPrice,
+            candle.time,
+            reason,
+          );
+          replacePaperPortfolio(closedPortfolio);
+          void publishCopyEvent("open", { position: positionOnFill, accountBalance });
+          void publishCopyEvent("close", {
+            positionId: positionOnFill.id,
+            exitPrice,
+            closedAtTime: candle.time,
+            reason,
+            pnl: closedPortfolio.history[0]?.pnl || 0,
+          });
+          setPaperError("");
+          return;
+        }
+        replacePaperPortfolio(filledPortfolio);
+        void publishCopyEvent("open", { position: positionOnFill, accountBalance });
+        setPaperError("");
+        return;
+      }
+      return;
+    }
     if (
       !position ||
       position.provider !== provider ||
@@ -2648,16 +3405,7 @@ function App() {
         return;
       }
     }
-    const latestMark = candles[candles.length - 1]?.close;
-    if (latestMark && Number.isFinite(latestMark) && latestMark !== position.markPrice) {
-      const portfolio = paperPortfolioRef.current;
-      if (portfolio.openPosition?.id === position.id)
-        replacePaperPortfolio({
-          ...portfolio,
-          openPosition: { ...position, markPrice: latestMark },
-        });
-    }
-  }, [candles, interval, paperPortfolio.openPosition, provider, symbol]);
+  }, [candles, interval, paperPortfolio.openPosition, paperPortfolio.pendingOrder, provider, symbol]);
   function focusChartPattern(pattern: ChartPattern) {
     const completed = candles.filter((candle) => candle.closed);
     const first = completed[pattern.startIndex];
@@ -2964,6 +3712,7 @@ function App() {
       signalPlan.target === null
     ) return;
     setPaperDirection(signalPlan.direction);
+    setPaperOrderType("LIMIT");
     setPaperEntry(String(signalPlan.entry));
     setPaperStop(String(signalPlan.stop));
     setPaperTarget(String(signalPlan.target));
@@ -2975,8 +3724,33 @@ function App() {
       setPaperDockExpanded(true);
       return;
     }
-    if (paperPortfolioRef.current.openPosition) {
-      setPaperError("Close the open demo position before opening another.");
+    const portfolioBeforeOrder = paperPortfolioRef.current;
+    if (portfolioBeforeOrder.pendingOrder) {
+      setPaperError("Cancel the pending order before placing another trade.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    const existingPosition = portfolioBeforeOrder.openPosition;
+    const isReversal = Boolean(
+      existingPosition &&
+      existingPosition.provider === provider &&
+      existingPosition.symbol === symbol &&
+      existingPosition.direction !== directionOverride,
+    );
+    if (existingPosition && !isReversal) {
+      setPaperError(existingPosition.provider === provider && existingPosition.symbol === symbol
+        ? `You already have an open ${existingPosition.direction}. Choose the opposite side to reverse it, or close it first.`
+        : `Close the open ${existingPosition.symbol} position before trading another market.`);
+      setPaperDockExpanded(true);
+      return;
+    }
+    if (isReversal && paperOrderType !== "MARKET") {
+      setPaperError("Switch to Market to close the current position and reverse against live order-book depth.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    if (paperOrderType === "MARKET" && !paperBookIsFresh) {
+      setPaperError("Market execution is paused until the selected exchange order book is synchronized and live.");
       setPaperDockExpanded(true);
       return;
     }
@@ -2986,33 +3760,113 @@ function App() {
       setPaperDockExpanded(true);
       return;
     }
-    const entryValue = paperEntry.trim() ? Number(paperEntry) : current.close;
-    const stopDistance = Math.max(
-      (analysis?.atr ?? entryValue * 0.01) * 1.5,
-      entryValue * 0.001,
+    const requestedEntry = paperOrderType === "MARKET"
+      ? paperExecutablePrice ?? 0
+      : paperEntry.trim()
+        ? Number(paperEntry)
+        : current.close;
+    if (!Number.isFinite(requestedEntry) || requestedEntry <= 0) {
+      setPaperError("Enter a valid price for the limit order.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    const isMarketableLimit = paperOrderType === "LIMIT" && (
+      directionOverride === "LONG"
+        ? paperBookIsFresh && requestedEntry >= (matchingPaperOrderBook?.bestAsk ?? Number.POSITIVE_INFINITY)
+        : paperBookIsFresh && requestedEntry <= (matchingPaperOrderBook?.bestBid ?? 0)
     );
+    const fillsImmediately = paperOrderType === "MARKET" || isMarketableLimit;
+    const executionLevels = matchingPaperOrderBook
+      ? directionOverride === "LONG"
+        ? matchingPaperOrderBook.asks
+        : matchingPaperOrderBook.bids
+      : [];
+    const limitExecutionPrice = paperOrderType === "LIMIT" ? requestedEntry : undefined;
+    let entryValue = fillsImmediately
+      ? paperExecutablePrice ?? requestedEntry
+      : requestedEntry;
+    let stopValue = 0;
+    let targetValue = 0;
+    let quoteResult: ReturnType<typeof calculatePaperQuote> = { quote: null, error: "" };
     const isCurrentDirection = directionOverride === paperDirection;
-    const stopValue = isCurrentDirection && paperStop.trim()
-      ? Number(paperStop)
-      : directionOverride === "LONG"
-        ? entryValue - stopDistance
-        : entryValue + stopDistance;
-    const targetValue = isCurrentDirection && paperTarget.trim()
-      ? Number(paperTarget)
-      : directionOverride === "LONG"
-        ? entryValue + stopDistance * 2
-        : entryValue - stopDistance * 2;
-    const quoteResult = calculatePaperQuote({
-      direction: directionOverride,
-      entry: entryValue,
-      stop: stopValue,
-      target: targetValue,
-      riskPercent: Number(paperRiskPercent),
-      leverage: Number(paperLeverage),
-      maintenanceMarginPercent: Number(paperMaintenanceMarginPercent),
-      feePercent: Number(paperFeePercent),
-      balance: paperPortfolio.balance,
-    });
+    let quoteBalance = portfolioBeforeOrder.balance;
+    const updateQuoteForEntry = (price: number) => {
+      const stopDistance = Math.max(
+        (analysis?.atr ?? price * 0.01) * 1.5,
+        price * 0.001,
+      );
+      stopValue = isCurrentDirection && paperStop.trim()
+        ? Number(paperStop)
+        : directionOverride === "LONG"
+          ? price - stopDistance
+          : price + stopDistance;
+      targetValue = isCurrentDirection && paperTarget.trim()
+        ? Number(paperTarget)
+        : directionOverride === "LONG"
+          ? price + stopDistance * 2
+          : price - stopDistance * 2;
+      quoteResult = calculatePaperQuote({
+        direction: directionOverride,
+        entry: price,
+        stop: stopValue,
+        target: targetValue,
+        riskPercent: Number(paperRiskPercent),
+        leverage: Number(paperLeverage),
+        maintenanceMarginPercent: Number(paperMaintenanceMarginPercent),
+        feePercent: Number(paperFeePercent),
+        balance: quoteBalance,
+      });
+    };
+
+    let reversalExitPrice = 0;
+    if (isReversal && existingPosition && matchingPaperOrderBook && paperBookIsFresh) {
+      const closeSide = existingPosition.direction === "LONG" ? "sell" : "buy";
+      const closeLevels = existingPosition.direction === "LONG"
+        ? matchingPaperOrderBook.bids
+        : matchingPaperOrderBook.asks;
+      const closeFill = estimatePaperBookFill(closeLevels, existingPosition.quantity, undefined, closeSide);
+      if (!closeFill.complete) {
+        setPaperError("The live book does not show enough depth to close the open position safely.");
+        setPaperDockExpanded(true);
+        return;
+      }
+      reversalExitPrice = closeFill.averagePrice;
+    }
+    const reversalClosedAt = Math.floor(Date.now() / 1000);
+    const portfolioAfterReversal = isReversal && existingPosition
+      ? recordPaperClose(
+          portfolioBeforeOrder,
+          existingPosition,
+          reversalExitPrice,
+          reversalClosedAt,
+          "Closed manually",
+        )
+      : portfolioBeforeOrder;
+    quoteBalance = portfolioAfterReversal.balance;
+
+    if (fillsImmediately && (!matchingPaperOrderBook || !paperBookIsFresh)) {
+      setPaperError("A synchronized live order book is required for an immediate fill. The limit order was not placed.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      updateQuoteForEntry(entryValue);
+      if (!quoteResult.quote || !fillsImmediately) break;
+      const fill = estimatePaperBookFill(
+        executionLevels,
+        quoteResult.quote.quantity,
+        limitExecutionPrice,
+        directionOverride === "LONG" ? "buy" : "sell",
+      );
+      if (!fill.complete) {
+        setPaperError("There is not enough visible depth to fill this order size. Reduce risk or choose a more liquid market.");
+        setPaperDockExpanded(true);
+        return;
+      }
+      if (Math.abs(fill.averagePrice - entryValue) <= Math.max(entryValue * 1e-10, 1e-12)) break;
+      entryValue = fill.averagePrice;
+    }
+    updateQuoteForEntry(entryValue);
     if (!quoteResult.quote) {
       setPaperDirection(directionOverride);
       if (!isCurrentDirection) {
@@ -3023,19 +3877,76 @@ function App() {
       setPaperDockExpanded(true);
       return;
     }
+    if (fillsImmediately) {
+      const finalFill = estimatePaperBookFill(
+        executionLevels,
+        quoteResult.quote.quantity,
+        limitExecutionPrice,
+        directionOverride === "LONG" ? "buy" : "sell",
+      );
+      if (!finalFill.complete) {
+        setPaperError("The book changed before the simulated order could be filled. Please retry against the refreshed depth.");
+        setPaperDockExpanded(true);
+        return;
+      }
+      entryValue = finalFill.averagePrice;
+      updateQuoteForEntry(entryValue);
+      if (!quoteResult.quote) {
+        setPaperError(quoteResult.error);
+        setPaperDockExpanded(true);
+        return;
+      }
+    }
+    if (isReversal && existingPosition) {
+      replacePaperPortfolio(portfolioAfterReversal);
+      void publishCopyEvent("close", {
+        positionId: existingPosition.id,
+        exitPrice: reversalExitPrice,
+        closedAtTime: reversalClosedAt,
+        reason: "Closed manually",
+        pnl: portfolioAfterReversal.history[0]?.pnl || 0,
+      });
+    }
     if (!isCurrentDirection) {
       setPaperDirection(directionOverride);
       setPaperStop("");
       setPaperTarget("");
     }
     const quote = quoteResult.quote;
+    const tradeId = `${provider}-${symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    if (!fillsImmediately) {
+      const pendingOrder: PaperPendingOrder = {
+        id: tradeId,
+        direction: directionOverride,
+        provider,
+        symbol,
+        interval,
+        placedAtTime: current.time,
+        limitPrice: entryValue,
+        stop: stopValue,
+        target: targetValue,
+        quantity: quote.quantity,
+        leverage: Number(paperLeverage),
+        margin: quote.margin,
+        maintenanceMarginPercent: Number(paperMaintenanceMarginPercent),
+        liquidationPrice: quote.liquidationPrice,
+        riskAmount: quote.stopLoss,
+        feeRate: quote.feeRate,
+      };
+      replacePaperPortfolio({
+        ...paperPortfolioRef.current,
+        pendingOrder,
+      });
+      setPaperError("");
+      return;
+    }
     const position: PaperPosition = {
-      id: `${provider}-${symbol}-${Date.now()}`,
+      id: tradeId,
       direction: directionOverride,
       provider,
       symbol,
       interval,
-      openedAtTime: latestCompleted.time,
+      openedAtTime: current.time,
       entry: entryValue,
       stop: stopValue,
       target: targetValue,
@@ -3045,34 +3956,66 @@ function App() {
       liquidationPrice: quote.liquidationPrice,
       riskAmount: quote.stopLoss,
       feeRate: quote.feeRate,
-      markPrice: current.close,
+      markPrice: paperMarkPrice > 0 ? paperMarkPrice : current.close,
     };
     const accountBalance = paperPortfolioRef.current.balance;
     replacePaperPortfolio({
       ...paperPortfolioRef.current,
       openPosition: position,
+      pendingOrder: null,
     });
     void publishCopyEvent("open", { position, accountBalance });
     setPaperError("");
   }
+  function cancelPendingPaperOrder() {
+    const pendingOrder = paperPortfolioRef.current.pendingOrder;
+    if (!pendingOrder) return;
+    replacePaperPortfolio({
+      ...paperPortfolioRef.current,
+      pendingOrder: null,
+    });
+    setPaperError("");
+  }
   function closePaperPositionAtMark() {
     const position = paperPortfolioRef.current.openPosition;
-    if (!position || !current || !paperPositionMatchesChart) return;
+    if (!position) return;
     const portfolio = paperPortfolioRef.current;
     if (portfolio.openPosition?.id !== position.id) return;
+    if (
+      position.provider !== provider ||
+      position.symbol !== symbol ||
+      !paperBookIsFresh ||
+      !matchingPaperOrderBook
+    ) {
+      setPaperError("Select the open position’s market and wait for its live order book before closing.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    const closeSide = position.direction === "LONG" ? "sell" : "buy";
+    const closeLevels = position.direction === "LONG"
+      ? matchingPaperOrderBook.bids
+      : matchingPaperOrderBook.asks;
+    const closeFill = estimatePaperBookFill(closeLevels, position.quantity, undefined, closeSide);
+    if (!closeFill.complete) {
+      setPaperError("There is not enough visible order-book depth to close the full position. Try again after depth updates.");
+      setPaperDockExpanded(true);
+      return;
+    }
+    const exitPrice = closeFill.averagePrice;
+    const closedAtTime = Math.floor(Date.now() / 1000);
     const closedPortfolio = recordPaperClose(
       portfolio,
       position,
-      current.close,
-      current.time,
+      exitPrice,
+      closedAtTime,
       "Closed manually",
     );
     replacePaperPortfolio(closedPortfolio);
     if (!position.copiedFrom)
       void publishCopyEvent("close", {
         positionId: position.id,
-        exitPrice: current.close,
-        closedAtTime: current.time,
+        exitPrice,
+        closedAtTime,
         reason: "Closed manually",
         pnl: closedPortfolio.history[0]?.pnl || 0,
       });
@@ -4471,7 +5414,11 @@ function App() {
               </p>
             )}
             {createPortal(
-              <div className={`paper-dock${paperDockExpanded ? " is-expanded" : ""}`}>
+              <div
+                ref={paperDockRef}
+                id="paper-dock"
+                className={`paper-dock${paperDockExpanded ? " is-expanded" : ""}${paperFullscreen ? " is-fullscreen" : ""}`}
+              >
                 {paperDockExpanded && (
             <section className="paper-trading paper-dock-panel" id="paper-dock-panel" aria-labelledby="paper-trading-title">
               <div className="paper-heading">
@@ -4481,6 +5428,17 @@ function App() {
                   <small>Paper positions · saved on this device</small>
                 </span>
                 <span className="paper-mode-tag">SIMULATION</span>
+                <button
+                  className="paper-fullscreen-toggle"
+                  type="button"
+                  aria-label={paperFullscreen ? "Exit chart and demo trading workspace" : "Show chart alongside demo trading"}
+                  aria-pressed={paperFullscreen}
+                  title={paperFullscreen ? "Exit chart and trading workspace" : "Show chart and trading side by side"}
+                  onClick={togglePaperFullscreen}
+                >
+                  {paperFullscreen ? <Minimize2 size={16} aria-hidden="true" /> : <Maximize2 size={16} aria-hidden="true" />}
+                  <span>{paperFullscreen ? "Exit workspace" : "Chart + trading"}</span>
+                </button>
               </div>
               <div className="paper-account-grid">
                 <div><span>Balance</span><strong>{formatMoney(paperPortfolio.balance)}</strong></div>
@@ -4488,47 +5446,205 @@ function App() {
                 <div><span>Available</span><strong>{formatMoney(paperAvailable)}</strong></div>
                 <div>
                   <span>Unrealized P&amp;L</span>
-                  <strong className={paperUnrealizedPnl === null ? "" : paperUnrealizedPnl >= 0 ? "positive" : "negative"}>
-                    {paperUnrealizedPnl === null ? "—" : formatMoney(paperUnrealizedPnl)}
+                  <strong className={paperOutcomeClass}>
+                    {paperUnrealizedPnl === null ? "—" : formatSignedMoney(paperUnrealizedPnl)}
                   </strong>
+                  {paperUnrealizedReturn !== null && (
+                    <small className={`paper-account-return ${paperOutcomeClass}`}>
+                      {formatSignedPercent(paperUnrealizedReturn)} ROE · before close fees
+                    </small>
+                  )}
                 </div>
               </div>
+
+              {paperPortfolio.pendingOrder && (
+                <div className={`paper-pending-order ${paperPortfolio.pendingOrder.direction.toLowerCase()}`}>
+                  <div className="paper-pending-copy">
+                    <span className="paper-position-badge">PENDING · {paperPortfolio.pendingOrder.direction} LIMIT</span>
+                    <strong>{paperPortfolio.pendingOrder.symbol} · {formatPrice(paperPortfolio.pendingOrder.limitPrice)}</strong>
+                    <small>
+                      {paperPortfolio.pendingOrder.provider.toUpperCase()} · {paperPortfolio.pendingOrder.interval}
+                      {matchedPendingLiveMark
+                        ? ` · Mark ${formatPrice(matchedPendingLiveMark.price)}`
+                        : " · waiting for mark"}
+                      {` · Reserved ${formatMoney(paperPortfolio.pendingOrder.margin)}`}
+                      {paperMarkFeedState === "live"
+                        ? " · live price watch"
+                        : " · reconnecting to its market price"}
+                    </small>
+                  </div>
+                  <button type="button" onClick={cancelPendingPaperOrder}>Cancel order</button>
+                </div>
+              )}
 
               {activePaperPosition && (
                 <div className={`paper-open-position ${activePaperPosition.direction.toLowerCase()}`}>
                   <div className="paper-open-heading">
                     <span className="paper-position-badge">OPEN · {activePaperPosition.direction}</span>
-                    <strong>{activePaperPosition.symbol} · {activePaperPosition.interval}</strong>
+                    <strong>{activePaperPosition.symbol}</strong>
+                    <small>{activePaperPosition.provider.toUpperCase()} · ISOLATED · {activePaperPosition.interval}</small>
                   </div>
-                  {paperPositionMatchesChart ? (
-                    <>
-                      <div className="paper-position-levels">
-                        <div><span>Entry</span><strong>{formatPrice(activePaperPosition.entry)}</strong></div>
-                        <div><span>Chart price</span><strong>{formatPrice(paperMarkPrice)}</strong></div>
-                        <div><span>Stop</span><strong>{formatPrice(activePaperPosition.stop)}</strong></div>
-                        <div><span>Target</span><strong>{formatPrice(activePaperPosition.target)}</strong></div>
-                        <div><span>Est. liquidation</span><strong>{formatPrice(activePaperPosition.liquidationPrice)}</strong></div>
-                        <div><span>Size · leverage</span><strong>{activePaperPosition.quantity.toLocaleString(undefined, { maximumFractionDigits: 8 })} · {activePaperPosition.leverage}×</strong></div>
+                  {paperUnrealizedPnl !== null && paperUnrealizedReturn !== null && (
+                    <div className={`paper-position-performance ${paperOutcomeClass}`} aria-live="polite">
+                      <div className="paper-performance-value">
+                        <span className="paper-performance-label">Unrealized P&amp;L · before fees</span>
+                        <strong>{formatSignedMoney(paperUnrealizedPnl)}</strong>
                       </div>
-                      <button className="paper-close-button" type="button" onClick={closePaperPositionAtMark}>
-                        Close demo position at chart price
-                      </button>
-                    </>
-                  ) : (
-                    <p className="paper-position-away">
-                      This position is on {activePaperPosition.provider.toUpperCase()}. Switch to that market and timeframe to manage it.
-                    </p>
+                      <div className="paper-performance-return">
+                        <span>ROE · live price-to-market</span>
+                        <strong>{formatSignedPercent(paperUnrealizedReturn)}</strong>
+                      </div>
+                      {paperEstimatedNetClosePnl !== null && (
+                        <div className="paper-performance-net">
+                          <span>Est. net if closed now · after round-trip fees</span>
+                          <strong className={paperEstimatedNetClosePnl >= 0 ? "positive" : "negative"}>
+                            {formatSignedMoney(paperEstimatedNetClosePnl)}
+                          </strong>
+                        </div>
+                      )}
+                      <span className={`paper-mark-status${paperMarkIsLive ? "" : " stale"}`}>
+                        {paperMarkIsLive
+                          ? paperPriceSourceLabel
+                          : paperMarkFeedState === "connecting"
+                            ? `CONNECTING · ${paperPriceSourceLabel}`
+                            : paperMarkFeedState === "stale"
+                              ? `FEED DELAYED · ${paperPriceSourceLabel}`
+                              : paperPriceSourceLabel}
+                      </span>
+                      {matchedPaperLiveMark && (
+                        <small className="paper-mark-time">
+                          Updated {new Date(matchedPaperLiveMark.updatedAt).toLocaleTimeString()}
+                        </small>
+                      )}
+                    </div>
                   )}
+                  <div className="paper-position-levels">
+                    <div><span>Entry price</span><strong>{formatPrice(activePaperPosition.entry)}</strong></div>
+                    <div className={paperOutcomeClass}><span>P&amp;L price</span><strong>{formatPrice(paperMarkPrice)}</strong></div>
+                    <div><span>Position size</span><strong>{activePaperPosition.quantity.toLocaleString(undefined, { maximumFractionDigits: 8 })}</strong></div>
+                    <div><span>Initial margin</span><strong>{formatMoney(activePaperPosition.margin)}</strong></div>
+                    <div><span>Leverage · mode</span><strong>{activePaperPosition.leverage}× · Isolated</strong></div>
+                    <div><span>Stop loss</span><strong>{formatPrice(activePaperPosition.stop)}</strong></div>
+                    <div><span>Take profit</span><strong>{formatPrice(activePaperPosition.target)}</strong></div>
+                    <div><span>Est. liquidation</span><strong>{formatPrice(activePaperPosition.liquidationPrice)}</strong></div>
+                  </div>
+                  <button
+                    className="paper-close-button"
+                    type="button"
+                    disabled={!paperBookIsFresh || activePaperPosition.provider !== provider || activePaperPosition.symbol !== symbol}
+                    onClick={closePaperPositionAtMark}
+                  >
+                    Close against live {activePaperPosition.direction === "LONG" ? "bids" : "asks"}
+                  </button>
                 </div>
               )}
 
+              <div className="paper-terminal-layout">
+                <section className="paper-orderbook-panel" aria-label={`${symbol} live order book`}>
+                  <div className="paper-orderbook-heading">
+                    <span><strong>Order book</strong><small>{provider.toUpperCase()} · {matchingPaperOrderBook?.marketType.toUpperCase() || "MARKET"} · {symbol}</small></span>
+                    <span className={`paper-book-status ${paperBookFeedState}`}>
+                      {paperBookFeedState === "live" ? "LIVE · WS" : paperBookFeedState === "connecting" ? "CONNECTING" : paperBookFeedState === "syncing" ? "SYNCING" : paperBookFeedState === "reconnecting" ? "RECONNECTING" : paperBookFeedState === "stale" ? "STALE" : "PAUSED"}
+                    </span>
+                  </div>
+                  <div className="paper-book-columns"><span>Price</span><span>Size</span><span>Total</span></div>
+                  {matchingPaperOrderBook ? (
+                    <>
+                      <div className="paper-book-side asks">
+                        {displayedPaperAsks.map((level) => (
+                          <button
+                            type="button"
+                            key={`ask-${level.price}`}
+                            className="paper-book-level ask"
+                            style={{ "--depth": `${Math.min(100, (level.cumulativeQuote / paperBookDepthMax) * 100)}%` } as React.CSSProperties}
+                            title="Use this ask price as a limit price"
+                            onClick={() => {
+                              setPaperOrderType("LIMIT");
+                              setPaperEntry(String(level.price));
+                              setPaperError("");
+                            }}
+                          >
+                            <span>{formatPrice(level.price)}</span>
+                            <span>{level.size.toLocaleString(undefined, { maximumFractionDigits: 5 })}</span>
+                            <span>{level.cumulativeQuote.toLocaleString(undefined, { notation: "compact", maximumFractionDigits: 2 })}</span>
+                          </button>
+                        ))}
+                      </div>
+                      <div className="paper-book-mid">
+                        <strong>{formatPrice(matchingPaperOrderBook.midPrice)}</strong>
+                        <span>Spread {formatPrice(matchingPaperOrderBook.spread)} · {matchingPaperOrderBook.spreadPercent.toFixed(3)}%</span>
+                      </div>
+                      <div className="paper-book-side bids">
+                        {displayedPaperBids.map((level) => (
+                          <button
+                            type="button"
+                            key={`bid-${level.price}`}
+                            className="paper-book-level bid"
+                            style={{ "--depth": `${Math.min(100, (level.cumulativeQuote / paperBookDepthMax) * 100)}%` } as React.CSSProperties}
+                            title="Use this bid price as a limit price"
+                            onClick={() => {
+                              setPaperOrderType("LIMIT");
+                              setPaperEntry(String(level.price));
+                              setPaperError("");
+                            }}
+                          >
+                            <span>{formatPrice(level.price)}</span>
+                            <span>{level.size.toLocaleString(undefined, { maximumFractionDigits: 5 })}</span>
+                            <span>{level.cumulativeQuote.toLocaleString(undefined, { notation: "compact", maximumFractionDigits: 2 })}</span>
+                          </button>
+                        ))}
+                      </div>
+                      <div className="paper-book-updated">WS received {new Date(matchingPaperOrderBook.updatedAt).toLocaleTimeString()} · exchange {new Date(matchingPaperOrderBook.exchangeTime).toLocaleTimeString()}</div>
+                    </>
+                  ) : (
+                    <div className="paper-book-empty">
+                      {paperBookFeedState === "stale"
+                        ? "This market’s public depth is temporarily unavailable."
+                        : "Connecting to the exchange’s public depth feed…"}
+                    </div>
+                  )}
+                </section>
+                <div className="paper-ticket-column">
               <div className="paper-setup">
                 <div className="paper-section-heading">
                   <span>
                     <strong>Position setup</strong>
-                    <small>Set direction, entry, stop, and target</small>
+                    <small>Choose an order type, then set direction and protection</small>
                   </span>
                 </div>
+                <div className="paper-order-switch" role="group" aria-label="Demo order type">
+                  <button
+                    type="button"
+                    className={paperOrderType === "MARKET" ? "active" : ""}
+                    aria-pressed={paperOrderType === "MARKET"}
+                    onClick={() => {
+                      setPaperOrderType("MARKET");
+                      setPaperEntry("");
+                      setPaperStop("");
+                      setPaperTarget("");
+                      setPaperError("");
+                    }}
+                  >Market</button>
+                  <button
+                    type="button"
+                    className={paperOrderType === "LIMIT" ? "active" : ""}
+                    aria-pressed={paperOrderType === "LIMIT"}
+                    onClick={() => {
+                      setPaperOrderType("LIMIT");
+                      setPaperEntry(current ? String(current.close) : "");
+                      setPaperStop("");
+                      setPaperTarget("");
+                      setPaperError("");
+                    }}
+                  >Limit</button>
+                </div>
+                <p className="paper-order-note">
+                  {paperOrderType === "MARKET"
+                    ? `Market buy takes asks; market sell takes bids${paperExecutablePrice ? ` · best price ${formatPrice(paperExecutablePrice)}` : " · waiting for live depth"}. Final entry uses depth-weighted fill.`
+                    : paperLimitIsMarketable
+                      ? "This limit crosses the live book and will fill only against available depth at your limit price or better."
+                      : "The limit stays pending until the chart price reaches it. Reserved margin is released if you cancel."}
+                </p>
                 <div className="paper-direction-switch" role="group" aria-label="Demo position direction">
                   <button
                     type="button"
@@ -4559,9 +5675,15 @@ function App() {
                   )}
                 </div>
                 <div className="paper-input-grid paper-level-inputs">
-                  <label>Entry
-                    <input type="number" min="0" step="any" placeholder="—" value={paperEntry || (current ? String(current.close) : "")} onChange={(event) => setPaperEntry(event.target.value)} />
-                  </label>
+                  {paperOrderType === "MARKET" ? (
+                    <label>Market price
+                      <input type="number" aria-label="Current executable market price" value={paperExecutablePrice ? String(paperExecutablePrice) : ""} placeholder="Waiting for live book" readOnly />
+                    </label>
+                  ) : (
+                    <label>Limit price
+                      <input type="number" min="0" step="any" placeholder="Limit price" value={paperEntry || (current ? String(current.close) : "")} onChange={(event) => setPaperEntry(event.target.value)} />
+                    </label>
+                  )}
                   <label>Stop
                     <input type="number" min="0" step="any" placeholder="—" value={paperStop || (current ? String(defaultPaperStop) : "")} onChange={(event) => setPaperStop(event.target.value)} />
                   </label>
@@ -4614,15 +5736,128 @@ function App() {
                 <button
                   className={`paper-open-button ${paperDirection.toLowerCase()}`}
                   type="button"
-                  disabled={!paperQuoteResult.quote || Boolean(activePaperPosition) || !current}
+                  disabled={!paperQuoteResult.quote || !canSubmitPaperDirection(paperDirection)}
                   onClick={() => openPaperPosition()}
                 >
-                  {activePaperPosition ? "Close the open demo position first" : `Open ${paperDirection} demo position`}
+                  {activePaperPosition
+                    ? paperCanReverseAtMarket
+                      ? `Close ${activePaperPosition.direction} · open ${paperDirection}`
+                      : "Manage the open demo position first"
+                    : paperPortfolio.pendingOrder
+                      ? "Cancel the pending order first"
+                    : paperOrderType === "LIMIT"
+                      ? `Place ${paperDirection} limit order`
+                      : `Open ${paperDirection} market position`}
                 </button>
                 <p className="paper-disclaimer">
-                  Local simulation only; no orders are sent. Assumes a USD/USDT linear contract. Stop/target fills use chart candles, with stop first if both are touched. The isolated liquidation price is a simplified estimate; exchange risk tiers, Mark Price, fees, funding, and slippage can change real outcomes.
+                  Local simulation only; no orders are sent. Prices and unrealized P&amp;L refresh from the selected market feed while this app is open (mark price where available, otherwise last traded price). Limit, stop, target, and liquidation events are simulated; funding, slippage, partial fills, venue fee tiers, and exchange risk tiers are not modeled.
                 </p>
               </div>
+                </div>
+              </div>
+
+              {paperFullscreen && (
+                <section className="paper-terminal-activity" aria-label="Demo account activity">
+                  <div className="paper-terminal-tabs" role="tablist" aria-label="Demo order activity">
+                    {([
+                      ["POSITIONS", `Positions ${activePaperPosition ? "(1)" : "(0)"}`],
+                      ["OPEN_ORDERS", `Open orders ${paperPortfolio.pendingOrder ? "(1)" : "(0)"}`],
+                      ["TRADE_HISTORY", `Trade history (${paperPortfolio.history.length})`],
+                    ] as const).map(([tab, label]) => (
+                      <button
+                        type="button"
+                        role="tab"
+                        key={tab}
+                        aria-selected={paperTerminalTab === tab}
+                        className={paperTerminalTab === tab ? "active" : ""}
+                        onClick={() => setPaperTerminalTab(tab)}
+                      >{label}</button>
+                    ))}
+                  </div>
+                  <div className="paper-terminal-tabpanel" role="tabpanel">
+                    {paperTerminalTab === "POSITIONS" ? (
+                      activePaperPosition ? (
+                        <div className="paper-terminal-position-row">
+                          <div className="paper-terminal-position-heading">
+                            <span className={`paper-history-direction ${activePaperPosition.direction.toLowerCase()}`}>{activePaperPosition.direction}</span>
+                            <strong>{activePaperPosition.symbol}</strong>
+                            <small>{activePaperPosition.provider.toUpperCase()} · {activePaperPosition.leverage}× · Isolated</small>
+                          </div>
+                          <div><span>Entry</span><strong>{formatPrice(activePaperPosition.entry)}</strong></div>
+                          <div><span>Mark</span><strong>{formatPrice(paperMarkPrice)}</strong></div>
+                          <div className={paperOutcomeClass}><span>Unrealized · gross</span><strong>{paperUnrealizedPnl === null ? "—" : formatSignedMoney(paperUnrealizedPnl)}</strong></div>
+                          <div><span>Est. net close</span><strong className={paperEstimatedNetClosePnl !== null && paperEstimatedNetClosePnl >= 0 ? "positive" : "negative"}>{paperEstimatedNetClosePnl === null ? "—" : formatSignedMoney(paperEstimatedNetClosePnl)}</strong></div>
+                          <button className="paper-terminal-close" type="button" disabled={!paperBookIsFresh || activePaperPosition.provider !== provider || activePaperPosition.symbol !== symbol} onClick={closePaperPositionAtMark}>Close at live depth</button>
+                        </div>
+                      ) : (
+                        <p className="paper-history-empty">No open demo positions.</p>
+                      )
+                    ) : paperTerminalTab === "OPEN_ORDERS" ? (
+                      paperPortfolio.pendingOrder ? (
+                        <div className="paper-terminal-position-row">
+                          <div className="paper-terminal-position-heading">
+                            <span className={`paper-history-direction ${paperPortfolio.pendingOrder.direction.toLowerCase()}`}>LIMIT · {paperPortfolio.pendingOrder.direction}</span>
+                            <strong>{paperPortfolio.pendingOrder.symbol}</strong>
+                            <small>{paperPortfolio.pendingOrder.provider.toUpperCase()} · placed {new Date(paperPortfolio.pendingOrder.placedAtTime * 1000).toLocaleString()}</small>
+                          </div>
+                          <div><span>Limit price</span><strong>{formatPrice(paperPortfolio.pendingOrder.limitPrice)}</strong></div>
+                          <div><span>Reserved margin</span><strong>{formatMoney(paperPortfolio.pendingOrder.margin)}</strong></div>
+                          <div><span>Stop / target</span><strong>{formatPrice(paperPortfolio.pendingOrder.stop)} / {formatPrice(paperPortfolio.pendingOrder.target)}</strong></div>
+                          <button className="paper-terminal-close" type="button" onClick={cancelPendingPaperOrder}>Cancel order</button>
+                        </div>
+                      ) : (
+                        <p className="paper-history-empty">No pending demo orders.</p>
+                      )
+                    ) : (
+                      <div className="paper-history-content">
+                        {paperPortfolio.history.length > 0 ? (
+                          <>
+                            <div className="paper-history-stats">
+                              <div><span>Net realized P&amp;L</span><strong className={paperHistoryNetPnl >= 0 ? "positive" : "negative"}>{formatSignedMoney(paperHistoryNetPnl)}</strong></div>
+                              <div><span>Win rate</span><strong>{paperHistoryWinRate.toFixed(1)}%</strong></div>
+                              <div><span>Winning trades</span><strong>{paperHistoryWins} / {paperPortfolio.history.length}</strong></div>
+                            </div>
+                            <div className="paper-history-filters" role="group" aria-label="Filter trade history">
+                              {(["ALL", "WINS", "LOSSES"] as const).map((filter) => (
+                                <button type="button" key={filter} className={paperHistoryFilter === filter ? "active" : ""} aria-pressed={paperHistoryFilter === filter} onClick={() => setPaperHistoryFilter(filter)}>
+                                  {filter === "ALL" ? "All trades" : filter === "WINS" ? "Winners" : "Losers"}
+                                </button>
+                              ))}
+                            </div>
+                            <div className="paper-history-list">
+                              {visiblePaperHistory.length > 0 ? visiblePaperHistory.map((trade) => (
+                                <article className="paper-history-trade" key={trade.id}>
+                                  <div className="paper-history-trade-heading">
+                                    <div className="paper-history-instrument">
+                                      <span className={`paper-history-direction ${trade.direction.toLowerCase()}`}>{trade.direction}</span>
+                                      <strong>{trade.symbol}</strong>
+                                      <small>{trade.provider.toUpperCase()} · {new Date(trade.closedAtTime * 1000).toLocaleString()}</small>
+                                    </div>
+                                    <div className={`paper-history-result ${trade.pnl >= 0 ? "positive" : "negative"}`}>
+                                      <strong>{formatSignedMoney(trade.pnl)}</strong>
+                                      <small>{formatSignedPercent(trade.margin > 0 ? (trade.pnl / trade.margin) * 100 : 0)} on margin</small>
+                                    </div>
+                                  </div>
+                                  <div className="paper-history-trade-levels">
+                                    <div><span>Entry</span><strong>{formatPrice(trade.entry)}</strong></div>
+                                    <div><span>Exit</span><strong>{formatPrice(trade.exitPrice)}</strong></div>
+                                    <div><span>Size · leverage</span><strong>{trade.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })} · {trade.leverage}×</strong></div>
+                                    <div><span>Close reason</span><strong>{trade.reason}</strong></div>
+                                  </div>
+                                  <div className="paper-history-trade-footer">
+                                    <span>Closed {new Date(trade.closedAtTime * 1000).toLocaleString()}</span>
+                                    <button type="button" onClick={() => downloadPaperPnlCard(trade)} aria-label={`Download P and L card for ${trade.direction} ${trade.symbol}`}><Download size={13} aria-hidden="true" /> Download P&amp;L card</button>
+                                  </div>
+                                </article>
+                              )) : <p className="paper-history-empty">No {paperHistoryFilter === "WINS" ? "winning" : "losing"} trades yet.</p>}
+                            </div>
+                          </>
+                        ) : <p className="paper-history-empty">Closed demo trades will appear here.</p>}
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
 
               <section className="copy-trading" aria-labelledby="copy-trading-title">
                 <div className="copy-heading">
@@ -4744,19 +5979,76 @@ function App() {
                 <p className="copy-disclaimer">Simulation only. Copying runs while this app is open, uses your demo balance, and never sends orders to an exchange.</p>
               </section>
 
-              {paperPortfolio.history.length > 0 && (
-                <details className="paper-history">
-                  <summary>Recent demo trades ({paperPortfolio.history.length})</summary>
-                  <div className="paper-history-list">
-                    {paperPortfolio.history.slice(0, 5).map((trade) => (
-                      <div key={trade.id}>
-                        <span><b className={trade.direction.toLowerCase()}>{trade.direction}</b> {trade.symbol} · {trade.reason}</span>
-                        <strong className={trade.pnl >= 0 ? "positive" : "negative"}>{trade.pnl >= 0 ? "+" : "−"}{formatMoney(Math.abs(trade.pnl))}</strong>
-                      </div>
-                    ))}
+              {!paperFullscreen && <details className="paper-history">
+                <summary>
+                  <span className="paper-history-summary-title">
+                    <strong>Trade history</strong>
+                    <small>{paperPortfolio.history.length} closed</small>
+                  </span>
+                  <span className="paper-history-summary-total">
+                    <small>Realized P&amp;L</small>
+                    <strong className={paperHistoryNetPnl >= 0 ? "positive" : "negative"}>
+                      {formatSignedMoney(paperHistoryNetPnl)}
+                    </strong>
+                  </span>
+                  <ChevronDown size={15} aria-hidden="true" />
+                </summary>
+                {paperPortfolio.history.length > 0 ? (
+                  <div className="paper-history-content">
+                    <div className="paper-history-stats">
+                      <div><span>Net realized P&amp;L</span><strong className={paperHistoryNetPnl >= 0 ? "positive" : "negative"}>{formatSignedMoney(paperHistoryNetPnl)}</strong></div>
+                      <div><span>Win rate</span><strong>{paperHistoryWinRate.toFixed(1)}%</strong></div>
+                      <div><span>Winning trades</span><strong>{paperHistoryWins} / {paperPortfolio.history.length}</strong></div>
+                    </div>
+                    <div className="paper-history-filters" role="group" aria-label="Filter trade history">
+                      {(["ALL", "WINS", "LOSSES"] as const).map((filter) => (
+                        <button
+                          key={filter}
+                          type="button"
+                          className={paperHistoryFilter === filter ? "active" : ""}
+                          aria-pressed={paperHistoryFilter === filter}
+                          onClick={() => setPaperHistoryFilter(filter)}
+                        >
+                          {filter === "ALL" ? "All trades" : filter === "WINS" ? "Winners" : "Losers"}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="paper-history-list">
+                      {visiblePaperHistory.length > 0 ? visiblePaperHistory.map((trade) => (
+                        <article className="paper-history-trade" key={trade.id}>
+                          <div className="paper-history-trade-heading">
+                            <div className="paper-history-instrument">
+                              <span className={`paper-history-direction ${trade.direction.toLowerCase()}`}>{trade.direction}</span>
+                              <strong>{trade.symbol}</strong>
+                              <small>{trade.provider.toUpperCase()} · {new Date(trade.closedAtTime * 1000).toLocaleString()}</small>
+                            </div>
+                            <div className={`paper-history-result ${trade.pnl >= 0 ? "positive" : "negative"}`}>
+                              <strong>{formatSignedMoney(trade.pnl)}</strong>
+                              <small>{formatSignedPercent(trade.margin > 0 ? (trade.pnl / trade.margin) * 100 : 0)} on margin</small>
+                            </div>
+                          </div>
+                          <div className="paper-history-trade-levels">
+                            <div><span>Entry</span><strong>{formatPrice(trade.entry)}</strong></div>
+                            <div><span>Exit</span><strong>{formatPrice(trade.exitPrice)}</strong></div>
+                            <div><span>Size · leverage</span><strong>{trade.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })} · {trade.leverage}×</strong></div>
+                            <div><span>Close reason</span><strong>{trade.reason}</strong></div>
+                          </div>
+                          <div className="paper-history-trade-footer">
+                            <span>Closed {new Date(trade.closedAtTime * 1000).toLocaleString()}</span>
+                            <button type="button" onClick={() => downloadPaperPnlCard(trade)} aria-label={`Download P and L card for ${trade.direction} ${trade.symbol}`}>
+                              <Download size={13} aria-hidden="true" /> Download P&amp;L card
+                            </button>
+                          </div>
+                        </article>
+                      )) : (
+                        <p className="paper-history-empty">No {paperHistoryFilter === "WINS" ? "winning" : "losing"} trades yet.</p>
+                      )}
+                    </div>
                   </div>
-                </details>
-              )}
+                ) : (
+                  <p className="paper-history-empty">Closed demo trades will appear here with their realized P&amp;L and downloadable cards.</p>
+                )}
+              </details>}
             </section>
                 )}
                 <div className="paper-dock-bar" aria-label="Demo trading controls">
@@ -4764,11 +6056,18 @@ function App() {
                     <span className="paper-icon"><Wallet size={15} aria-hidden="true" /></span>
                     <span className="paper-dock-copy">
                       <strong>Demo</strong>
-                      <small title={activePaperPosition ? `${activePaperPosition.direction} · ${activePaperPosition.symbol}` : symbol}>
+                      <small title={activePaperPosition ? `${activePaperPosition.direction} · ${activePaperPosition.symbol}` : paperPortfolio.pendingOrder ? `${paperPortfolio.pendingOrder.direction} LIMIT · ${paperPortfolio.pendingOrder.symbol}` : symbol}>
                         {activePaperPosition
                           ? `OPEN ${activePaperPosition.direction} · ${activePaperPosition.symbol}`
-                          : `${symbol} · ${formatMoney(paperPortfolio.balance)}`}
+                          : paperPortfolio.pendingOrder
+                            ? `PENDING ${paperPortfolio.pendingOrder.direction} LIMIT · ${paperPortfolio.pendingOrder.symbol}`
+                            : `${symbol} · ${formatMoney(paperPortfolio.balance)}`}
                       </small>
+                      {activePaperPosition && paperUnrealizedPnl !== null && paperUnrealizedReturn !== null && (
+                        <small className={`paper-dock-pnl ${paperOutcomeClass}`}>
+                          {formatSignedMoney(paperUnrealizedPnl)} · {formatSignedPercent(paperUnrealizedReturn)}
+                        </small>
+                      )}
                     </span>
                   </div>
                   <label className="paper-dock-leverage">
@@ -4777,6 +6076,7 @@ function App() {
                       aria-label="Demo leverage"
                       value={paperLeverage}
                       onChange={(event) => setPaperLeverage(event.target.value)}
+                      disabled={Boolean(activePaperPosition || paperPortfolio.pendingOrder)}
                     >
                       {[1, 2, 3, 5, 10, 20, 50].map((leverage) => (
                         <option value={leverage} key={leverage}>{leverage}×</option>
@@ -4786,15 +6086,37 @@ function App() {
                   <button
                     className="paper-dock-action long"
                     type="button"
-                    disabled={!current || Boolean(activePaperPosition)}
-                    title={activePaperPosition ? "Close the active demo position first" : "Open a LONG demo position"}
+                    disabled={!canSubmitPaperDirection("LONG")}
+                    title={activePaperPosition
+                      ? activePaperPosition.direction === "LONG"
+                        ? "A LONG position is already open"
+                        : canSubmitPaperDirection("LONG")
+                          ? "Close the SHORT and open a LONG against live asks and bids"
+                          : "Switch to Market to reverse, or manage the existing position first"
+                      : paperPortfolio.pendingOrder
+                        ? "Cancel the pending order first"
+                        : "Open a LONG demo position against live asks and depth"}
+                    aria-label={activePaperPosition?.direction === "SHORT" && canSubmitPaperDirection("LONG")
+                      ? "Close SHORT and open LONG against live order-book depth"
+                      : "Open LONG demo position"}
                     onClick={() => openPaperPosition("LONG")}
                   ><ArrowUpRight size={14} aria-hidden="true" /><span>LONG</span></button>
                   <button
                     className="paper-dock-action short"
                     type="button"
-                    disabled={!current || Boolean(activePaperPosition)}
-                    title={activePaperPosition ? "Close the active demo position first" : "Open a SHORT demo position"}
+                    disabled={!canSubmitPaperDirection("SHORT")}
+                    title={activePaperPosition
+                      ? activePaperPosition.direction === "SHORT"
+                        ? "A SHORT position is already open"
+                        : canSubmitPaperDirection("SHORT")
+                          ? "Close the LONG and open a SHORT against live bids and asks"
+                          : "Switch to Market to reverse, or manage the existing position first"
+                      : paperPortfolio.pendingOrder
+                        ? "Cancel the pending order first"
+                        : "Open a SHORT demo position against live bids and depth"}
+                    aria-label={activePaperPosition?.direction === "LONG" && canSubmitPaperDirection("SHORT")
+                      ? "Close LONG and open SHORT against live order-book depth"
+                      : "Open SHORT demo position"}
                     onClick={() => openPaperPosition("SHORT")}
                   ><ArrowDownRight size={14} aria-hidden="true" /><span>SHORT</span></button>
                   <button
@@ -4936,4 +6258,4 @@ function App() {
     </div>
   );
 }
-createRoot(document.getElementById("root")!).render(<App />);
+export default App;

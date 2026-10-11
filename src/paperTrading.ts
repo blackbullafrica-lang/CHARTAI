@@ -25,6 +25,25 @@ export type PaperPosition = {
   };
 };
 
+export type PaperPendingOrder = {
+  id: string;
+  direction: PaperDirection;
+  provider: string;
+  symbol: string;
+  interval: string;
+  placedAtTime: number;
+  limitPrice: number;
+  stop: number;
+  target: number;
+  quantity: number;
+  leverage: number;
+  margin: number;
+  maintenanceMarginPercent: number;
+  liquidationPrice: number;
+  riskAmount: number;
+  feeRate: number;
+};
+
 export type PaperClosedTrade = PaperPosition & {
   exitPrice: number;
   pnl: number;
@@ -35,6 +54,7 @@ export type PaperClosedTrade = PaperPosition & {
 export type PaperPortfolio = {
   balance: number;
   openPosition: PaperPosition | null;
+  pendingOrder: PaperPendingOrder | null;
   history: PaperClosedTrade[];
 };
 
@@ -63,11 +83,67 @@ export type PaperQuote = {
   feeRate: number;
 };
 
+export type PaperBookLevel = { price: number; size: number };
+
+export type PaperBookFill = {
+  averagePrice: number;
+  filledQuantity: number;
+  quoteNotional: number;
+  complete: boolean;
+};
+
 export const PAPER_INITIAL_BALANCE = 10_000;
 export const PAPER_STORAGE_KEY = "chart-ai.paper-trading.v1";
 
+export function estimatePaperBookFill(
+  levels: PaperBookLevel[],
+  quantity: number,
+  limitPrice?: number,
+  side: "buy" | "sell" = "buy",
+): PaperBookFill {
+  if (!Number.isFinite(quantity) || quantity <= 0)
+    return { averagePrice: 0, filledQuantity: 0, quoteNotional: 0, complete: false };
+  let remaining = quantity;
+  let filledQuantity = 0;
+  let quoteNotional = 0;
+  for (const level of levels) {
+    if (!Number.isFinite(level.price) || level.price <= 0 || !Number.isFinite(level.size) || level.size <= 0)
+      continue;
+    if (limitPrice !== undefined && (
+      (side === "buy" && level.price > limitPrice) ||
+      (side === "sell" && level.price < limitPrice)
+    )) break;
+    const filledAtLevel = Math.min(remaining, level.size);
+    filledQuantity += filledAtLevel;
+    quoteNotional += filledAtLevel * level.price;
+    remaining -= filledAtLevel;
+    if (remaining <= Math.max(quantity * 1e-10, 1e-12)) break;
+  }
+  const complete = remaining <= Math.max(quantity * 1e-8, 1e-10);
+  return {
+    averagePrice: filledQuantity > 0 ? quoteNotional / filledQuantity : 0,
+    filledQuantity,
+    quoteNotional,
+    complete,
+  };
+}
+
+export function estimatePaperLiquidationPrice(
+  entry: number,
+  direction: PaperDirection,
+  leverage: number,
+  maintenanceMarginPercent: number,
+  feeRate = 0,
+): number {
+  const maintenanceRate = maintenanceMarginPercent / 100;
+  const price = direction === "LONG"
+    ? entry * (1 - 1 / leverage + feeRate) / (1 - maintenanceRate - feeRate)
+    : entry * (1 + 1 / leverage - feeRate) / (1 + maintenanceRate + feeRate);
+  return Math.max(0, price);
+}
+
 export function createPaperPortfolio(): PaperPortfolio {
-  return { balance: PAPER_INITIAL_BALANCE, openPosition: null, history: [] };
+  return { balance: PAPER_INITIAL_BALANCE, openPosition: null, pendingOrder: null, history: [] };
 }
 
 export function readPaperPortfolio(): PaperPortfolio {
@@ -82,6 +158,26 @@ export function readPaperPortfolio(): PaperPortfolio {
       !Number.isFinite(candidate.balance) ||
       candidate.balance <= 0
     ) return createPaperPortfolio();
+    const pending = candidate.pendingOrder;
+    const validPending = !candidate.openPosition && pending &&
+      (pending.direction === "LONG" || pending.direction === "SHORT") &&
+      typeof pending.provider === "string" &&
+      typeof pending.symbol === "string" &&
+      typeof pending.interval === "string" &&
+      [
+        pending.placedAtTime,
+        pending.limitPrice,
+        pending.stop,
+        pending.target,
+        pending.quantity,
+        pending.leverage,
+        pending.margin,
+        pending.maintenanceMarginPercent,
+        pending.liquidationPrice,
+        pending.riskAmount,
+        pending.feeRate,
+      ].every((value) => typeof value === "number" && Number.isFinite(value)) &&
+      pending.limitPrice > 0 && pending.quantity > 0 && pending.leverage >= 1;
     return {
       balance: candidate.balance,
       openPosition:
@@ -92,8 +188,9 @@ export function readPaperPortfolio(): PaperPortfolio {
           candidate.openPosition.direction === "SHORT")
           ? candidate.openPosition
           : null,
+      pendingOrder: validPending ? pending : null,
       history: Array.isArray(candidate.history)
-        ? candidate.history.slice(0, 50)
+        ? candidate.history.slice(0, 500)
         : [],
     };
   } catch {
@@ -144,11 +241,12 @@ export function calculatePaperQuote(setup: PaperSetup): {
   const grossTargetProfit = Math.abs(target - entry) * quantity;
   const stopLoss = grossStopLoss + stopFees;
   const targetProfit = grossTargetProfit - targetFees;
-  const liquidationPrice = Math.max(
-    0,
-    entry * (isLong
-      ? 1 - 1 / leverage + maintenanceMarginRate
-      : 1 + 1 / leverage - maintenanceMarginRate),
+  const liquidationPrice = estimatePaperLiquidationPrice(
+    entry,
+    direction,
+    leverage,
+    setup.maintenanceMarginPercent,
+    feeRate,
   );
   if (isLong ? liquidationPrice >= stop : liquidationPrice <= stop)
     return {
@@ -179,9 +277,19 @@ export function paperPositionPnl(
   position: PaperPosition,
   exitPrice: number,
 ): number {
-  const sign = position.direction === "LONG" ? 1 : -1;
-  const grossPnl = (exitPrice - position.entry) * position.quantity * sign;
+  const grossPnl = paperGrossPositionPnl(position, exitPrice);
+  const feeRate = Number.isFinite(position.feeRate) && position.feeRate >= 0
+    ? position.feeRate
+    : 0;
   const roundTripFees =
-    position.quantity * (position.entry + exitPrice) * position.feeRate;
+    position.quantity * (position.entry + exitPrice) * feeRate;
   return grossPnl - roundTripFees;
+}
+
+export function paperGrossPositionPnl(
+  position: Pick<PaperPosition, "direction" | "entry" | "quantity">,
+  markPrice: number,
+): number {
+  const sign = position.direction === "LONG" ? 1 : -1;
+  return (markPrice - position.entry) * position.quantity * sign;
 }

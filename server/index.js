@@ -8,6 +8,7 @@ import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import copyTradingRouter from "./copyTrading.js";
+import { LiveOrderBookFeed, marketTypeFor } from "./orderBookFeed.js";
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
@@ -21,6 +22,7 @@ const providers = new Set([
   "hyperliquid",
   "mexc",
 ]);
+const candleCache = new Map();
 const intervalMap = {
   "5m": "5",
   "15m": "15",
@@ -634,6 +636,248 @@ async function candlesFor(provider, symbol, interval, requestedLimit = 500) {
     closed: c.closed ?? (c.time + seconds) * 1000 <= Date.now(),
   }));
 }
+async function paperMarkFor(provider, symbol) {
+  let url;
+  let requestInit = {};
+  let markKind = "last";
+
+  if (provider === "bybit") {
+    url = new URL("/v5/market/tickers", apiBases.bybit);
+    url.search = new URLSearchParams({ category: "linear", symbol }).toString();
+  } else if (provider === "aster") {
+    url = new URL("/fapi/v1/premiumIndex", apiBases.aster);
+    url.search = new URLSearchParams({ symbol }).toString();
+    markKind = "mark";
+  } else if (provider === "hyperliquid") {
+    const market = (await marketsFor("hyperliquid")).find(
+      (item) => item.symbol === symbol,
+    );
+    if (!market?.apiSymbol) throw new Error("Pair not listed on Hyperliquid Perpetuals");
+    url = new URL("/info", apiBases.hyperliquid);
+    requestInit = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "metaAndAssetCtxs" }),
+    };
+    markKind = "mark";
+  } else if (provider === "okx") {
+    const market = (await marketsFor("okx")).find((item) => item.symbol === symbol);
+    if (!market?.apiSymbol) throw new Error("Pair not listed on OKX Spot");
+    url = new URL("/api/v5/market/ticker", apiBases.okx);
+    url.search = new URLSearchParams({ instId: market.apiSymbol }).toString();
+  } else {
+    const base = provider === "binance" ? apiBases.binance : apiBases.mexc;
+    url = new URL("/api/v3/ticker/price", base);
+    url.search = new URLSearchParams({ symbol }).toString();
+  }
+
+  const response = ["binance", "okx"].includes(provider)
+    ? await exchangeRequestForProvider(provider, url, requestInit, 5000, 1)
+    : await exchangeRequestWithRetry(url, requestInit, 5000, 1);
+  if (!response.ok) throw new Error(`${provider} price API returned ${response.status}`);
+  const raw = await response.json();
+  let price;
+  if (provider === "bybit") {
+    if (raw.retCode !== 0) throw new Error(raw.retMsg || "Bybit price unavailable");
+    const ticker = raw.result?.list?.[0];
+    price = Number(ticker?.markPrice || ticker?.lastPrice);
+    markKind = ticker?.markPrice ? "mark" : "last";
+  } else if (provider === "aster") {
+    const ticker = Array.isArray(raw) ? raw[0] : raw;
+    price = Number(ticker?.markPrice || ticker?.price);
+  } else if (provider === "hyperliquid") {
+    const market = (await marketsFor("hyperliquid")).find(
+      (item) => item.symbol === symbol,
+    );
+    const assetIndex = raw?.[0]?.universe?.findIndex(
+      (asset) => asset.name === market?.apiSymbol,
+    );
+    price = Number(assetIndex >= 0 ? raw?.[1]?.[assetIndex]?.markPx : NaN);
+  } else if (provider === "okx") {
+    if (raw.code !== "0") throw new Error(raw.msg || "OKX price unavailable");
+    price = Number(raw.data?.[0]?.last);
+  } else {
+    price = Number(raw?.price);
+  }
+  if (!Number.isFinite(price) || price <= 0)
+    throw new Error(`${provider} returned an invalid price`);
+  return { price, markKind };
+}
+
+app.get("/api/mark-price", async (req, res) => {
+  const provider = String(req.query.provider || "").toLowerCase();
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!providers.has(provider) || !/^[\p{L}\p{N}]{2,40}$/u.test(symbol))
+    return res.status(400).json({ error: "Invalid exchange or trading pair" });
+  try {
+    const quote = await paperMarkFor(provider, symbol);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.json({ provider, symbol, ...quote, updatedAt: Date.now() });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Live price unavailable",
+    });
+  }
+});
+
+async function orderBookFor(provider, symbol) {
+  let url;
+  let requestInit = {};
+  if (provider === "bybit") {
+    url = new URL("/v5/market/orderbook", apiBases.bybit);
+    url.search = new URLSearchParams({ category: "linear", symbol, limit: "25" }).toString();
+  } else if (provider === "aster") {
+    url = new URL("/fapi/v1/depth", apiBases.aster);
+    url.search = new URLSearchParams({ symbol, limit: "25" }).toString();
+  } else if (provider === "hyperliquid") {
+    const market = (await marketsFor("hyperliquid")).find((item) => item.symbol === symbol);
+    if (!market?.apiSymbol) throw new Error("Pair not listed on Hyperliquid Perpetuals");
+    url = new URL("/info", apiBases.hyperliquid);
+    requestInit = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "l2Book", coin: market.apiSymbol }),
+    };
+  } else if (provider === "okx") {
+    const market = (await marketsFor("okx")).find((item) => item.symbol === symbol);
+    if (!market?.apiSymbol) throw new Error("Pair not listed on OKX Spot");
+    url = new URL("/api/v5/market/books", apiBases.okx);
+    url.search = new URLSearchParams({ instId: market.apiSymbol, sz: "20" }).toString();
+  } else {
+    const base = provider === "binance" ? apiBases.binance : apiBases.mexc;
+    url = new URL("/api/v3/depth", base);
+    url.search = new URLSearchParams({ symbol, limit: "20" }).toString();
+  }
+
+  const response = ["binance", "okx"].includes(provider)
+    ? await exchangeRequestForProvider(provider, url, requestInit, 5000, 1)
+    : await exchangeRequestWithRetry(url, requestInit, 5000, 1);
+  if (!response.ok) throw new Error(`${provider} order book returned ${response.status}`);
+  const raw = await response.json();
+  let bidRows;
+  let askRows;
+  if (provider === "bybit") {
+    if (raw.retCode !== 0) throw new Error(raw.retMsg || "Bybit order book unavailable");
+    bidRows = raw.result?.b;
+    askRows = raw.result?.a;
+  } else if (provider === "hyperliquid") {
+    bidRows = raw.levels?.[0];
+    askRows = raw.levels?.[1];
+  } else if (provider === "okx") {
+    if (raw.code !== "0") throw new Error(raw.msg || "OKX order book unavailable");
+    bidRows = raw.data?.[0]?.bids;
+    askRows = raw.data?.[0]?.asks;
+  } else {
+    bidRows = raw.bids;
+    askRows = raw.asks;
+  }
+
+  const normalize = (rows, descending) => {
+    let cumulativeQuote = 0;
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => {
+        const price = Number(Array.isArray(row) ? row[0] : row.px);
+        const size = Number(Array.isArray(row) ? row[1] : row.sz);
+        const quoteSize = price * size;
+        return { price, size, quoteSize };
+      })
+      .filter((level) => Number.isFinite(level.price) && level.price > 0 && Number.isFinite(level.size) && level.size > 0)
+      .sort((a, b) => descending ? b.price - a.price : a.price - b.price)
+      .slice(0, 12)
+      .map((level) => {
+        cumulativeQuote += level.quoteSize;
+        return { ...level, cumulativeQuote };
+      });
+  };
+  const bids = normalize(bidRows, true);
+  const asks = normalize(askRows, false);
+  if (!bids.length || !asks.length) throw new Error(`${provider} returned an empty order book`);
+  const bestBid = bids[0].price;
+  const bestAsk = asks[0].price;
+  const midPrice = (bestBid + bestAsk) / 2;
+  return {
+    bids,
+    asks,
+    bestBid,
+    bestAsk,
+    midPrice,
+    spread: bestAsk - bestBid,
+    spreadPercent: midPrice > 0 ? ((bestAsk - bestBid) / midPrice) * 100 : 0,
+  };
+}
+
+app.get("/api/orderbook", async (req, res) => {
+  const provider = String(req.query.provider || "").toLowerCase();
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!providers.has(provider) || !/^[\p{L}\p{N}]{2,40}$/u.test(symbol))
+    return res.status(400).json({ error: "Invalid exchange or trading pair" });
+  try {
+    const book = await orderBookFor(provider, symbol);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.json({ provider, symbol, marketType: marketTypeFor(provider), source: "rest-snapshot", ...book, updatedAt: Date.now() });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Order book unavailable",
+    });
+  }
+});
+
+app.get("/api/orderbook/stream", async (req, res) => {
+  const provider = String(req.query.provider || "").toLowerCase();
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!providers.has(provider) || !/^[\p{L}\p{N}]{2,40}$/u.test(symbol))
+    return res.status(400).json({ error: "Invalid exchange or trading pair" });
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  let closed = false;
+  let feed = null;
+  const send = (payload) => {
+    if (!closed && !res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+  send({ type: "state", state: "connecting", provider, symbol });
+  const heartbeat = setInterval(() => {
+    if (!closed && !res.writableEnded) res.write(": keep-alive\n\n");
+  }, 15000);
+  res.on("close", () => {
+    closed = true;
+    clearInterval(heartbeat);
+    feed?.stop();
+  });
+
+  try {
+    const market = (await marketsFor(provider)).find((item) => item.symbol === symbol);
+    if (!market) {
+      send({ type: "state", state: "stale", message: `${symbol} is not listed on ${provider.toUpperCase()}.`, provider, symbol });
+      res.end();
+      return;
+    }
+    if (closed) return;
+    feed = new LiveOrderBookFeed({
+      provider,
+      symbol,
+      market,
+      onBook: send,
+      onState: send,
+    });
+    feed.start();
+  } catch (error) {
+    send({
+      type: "state",
+      state: "stale",
+      message: error instanceof Error ? error.message : "Could not start the order book feed.",
+      provider,
+      symbol,
+    });
+    res.end();
+  }
+});
+
 app.get("/api/markets", async (req, res) => {
   const provider = String(req.query.provider || "binance").toLowerCase();
   if (provider === "all") {
@@ -740,8 +984,30 @@ app.get("/api/klines", async (req, res) => {
       limit,
     );
     if (candles.length < 2) throw new Error("Insufficient market candles");
+    const cacheKey = `${provider}:${normalizePair(symbol)}:${interval}`;
+    const previous = candleCache.get(cacheKey) || [];
+    const combined = new Map(previous.map((candle) => [candle.time, candle]));
+    for (const candle of candles) combined.set(candle.time, candle);
+    candleCache.set(
+      cacheKey,
+      [...combined.values()].sort((a, b) => a.time - b.time).slice(-500),
+    );
     res.json({ provider, symbol, interval, candles });
   } catch (e) {
+    const cachedCandles = candleCache.get(
+      `${provider}:${normalizePair(symbol)}:${interval}`,
+    );
+    if (cachedCandles?.length >= 2) {
+      res.setHeader("Cache-Control", "no-store");
+      return res.json({
+        provider,
+        symbol,
+        interval,
+        candles: cachedCandles.slice(-limit),
+        stale: true,
+        warning: "Exchange data is temporarily unavailable; showing the last successful candles.",
+      });
+    }
     res
       .status(502)
       .json({

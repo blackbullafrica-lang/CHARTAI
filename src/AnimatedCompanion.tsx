@@ -16,7 +16,9 @@ export function AnimatedCompanion({ onActivate }: AnimatedCompanionProps) {
 
     const artwork = new Image();
     artwork.decoding = "async";
-    artwork.src = companionArtwork;
+    artwork.src = typeof companionArtwork === "string"
+      ? companionArtwork
+      : companionArtwork.src;
 
     const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
     let reduceMotion = motionQuery.matches;

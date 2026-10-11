@@ -15,17 +15,19 @@ The searchable market picker combines every exchange reachable from the running 
 
 ## Run locally
 
-1. Install Node.js 20 or newer.
+1. Install Node.js 20.9 or newer.
 2. Run `npm install`.
 3. Copy `.env.example` to `.env` and set `GEMINI_API_KEY` and/or `VENICE_API_KEY`.
 4. Run `npm run dev`.
-5. Open `http://localhost:5173`.
+5. Open `http://localhost:3001`.
 
-For a production-style run, run `npm run build` followed by `npm start`. Express serves both `/api/*` and the built React application.
+The interface uses the Next.js App Router. The Node API runs alongside it, and Next.js forwards same-origin `/api/*` requests to that service. `npm start` respects the host-provided `PORT` value.
+
+For a production-style run, run `npm run build` followed by `npm start`.
 
 ## Deploy to Vercel
 
-The Vite build is served as static assets and `api/[...path].js` forwards API requests to the Express app. Import this repository into Vercel or deploy it with the Vercel CLI; the checked-in `vercel.json` sets the build command and `dist` output directory. Add `GEMINI_API_KEY` and/or `VENICE_API_KEY` as server-side Vercel Environment Variables to enable the corresponding AI features. Never add provider keys to the frontend or commit them to the repository.
+Vercel detects the Next.js app and `api/[...path].js` provides the existing Express API endpoints. Add `GEMINI_API_KEY` and/or `VENICE_API_KEY` as server-side Vercel Environment Variables to enable the corresponding AI features. Never add provider keys to the frontend or commit them to the repository.
 
 ## Google AI Studio
 
@@ -35,8 +37,8 @@ This project follows Google AI Studio's full-stack security model:
 - The browser never receives the Gemini API key.
 - The browser never receives the Venice API key either.
 - The server reads `GEMINI_API_KEY` and `VENICE_API_KEY` from the environment.
-- The server binds to `0.0.0.0` and respects the injected `PORT` value.
-- `npm run build` creates the React client and `npm start` serves the complete app.
+- The Next.js app binds to `0.0.0.0` and respects the injected `PORT` value; the private API service stays on localhost.
+- `npm run build` creates the Next.js app and `npm start` serves the complete app.
 
 Import the repository into Google AI Studio Build mode, open **Settings → Secrets**, and add `GEMINI_API_KEY`. To enable Venice as a chat choice, also add `VENICE_API_KEY` as a server secret. AI Studio injects those secrets into the server-side runtime. The public exchange URLs and `VENICE_API_URL` can remain at the defaults in `.env.example`.
 
